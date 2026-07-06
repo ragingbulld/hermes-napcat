@@ -155,13 +155,14 @@ def _sender_identity_label(role: str, user_id: str, display_name: str) -> str:
     """Return the model-visible sender label used by shared group sessions.
 
     QQ nicknames/cards are user-controlled and can collide, so they are not
-    included in the model-visible identity.  The gateway will wrap this label in
-    brackets, producing e.g. ``[user:123456]``.
+    included in the model-visible identity.  Make the label explicitly describe
+    the *speaker*, not the target of an action, e.g.
+    ``[发言者身份=owner;QQ=123456]``.
     """
     _ = display_name  # Deliberately ignored: display names are not authority.
     role_label = {"owner": "owner", "admin": "admin", "user": "user"}.get(role, "user")
     qq = _safe_identity_part(user_id, max_len=20) or "unknown"
-    return f"{role_label}:{qq}"
+    return f"发言者身份={role_label};QQ={qq}"
 
 
 def _napcat_acl_pre_tool_call(tool_name: str, **_: Any) -> dict | None:
