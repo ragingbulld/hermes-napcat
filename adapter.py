@@ -585,11 +585,19 @@ class NapCatAdapter(BasePlatformAdapter):
             if role not in {"owner", "admin"}:
                 return
 
-        original_message_id = str(event.get("message_id", "") or "")
-        if original_message_id:
-            self._remember_post_reply_reaction(original_message_id)
-            self._remember_post_reply_poke(original_message_id, sender_id, group_id)
-            await self._mark_processing(original_message_id)
+        # Mirror the gateway's own authorization check before adding QQ
+        # reactions.  The adapter's chat allowlist is intentionally coarse
+        # (which groups may reach Hermes), while GatewayRunner may still reject
+        # a specific sender via allow_from/group_allow_from/env ACLs.  If we add
+        # processing/done reactions before that second layer, an unauthorized
+        # message can look "completed" even though Hermes sent no reply.
+        upstream_authorized = self._is_sender_authorized(
+            sender_id,
+            "group" if is_group else "dm",
+            chat_id,
+        )
+        if upstream_authorized is False:
+            return
 
         text = _extract_text(segments)
         image_urls = _extract_images(segments)
@@ -667,6 +675,12 @@ class NapCatAdapter(BasePlatformAdapter):
 
         if not text and not media_urls:
             return
+
+        original_message_id = str(event.get("message_id", "") or "")
+        if original_message_id:
+            self._remember_post_reply_reaction(original_message_id)
+            self._remember_post_reply_poke(original_message_id, sender_id, group_id)
+            await self._mark_processing(original_message_id)
 
         source = SessionSource(
             platform=Platform("napcat"),
