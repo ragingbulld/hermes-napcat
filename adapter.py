@@ -154,14 +154,14 @@ def _safe_identity_part(value: str, *, max_len: int = 32) -> str:
 def _sender_identity_label(role: str, user_id: str, display_name: str) -> str:
     """Return the model-visible sender label used by shared group sessions.
 
-    QQ nicknames/cards are user-controlled and can collide.  Prefixing the
-    stable QQ number and NapCat role helps the model avoid mixing up speakers
-    and avoid attempting tools for ordinary group users.
+    QQ nicknames/cards are user-controlled and can collide, so they are not
+    included in the model-visible identity.  The gateway will wrap this label in
+    brackets, producing e.g. ``[权限：user；QQ：123456]``.
     """
+    _ = display_name  # Deliberately ignored: display names are not authority.
     role_label = {"owner": "owner", "admin": "admin", "user": "user"}.get(role, "user")
     qq = _safe_identity_part(user_id, max_len=20) or "unknown"
-    name = _safe_identity_part(display_name, max_len=32)
-    return f"{role_label} QQ:{qq} {name}" if name else f"{role_label} QQ:{qq}"
+    return f"权限：{role_label}；QQ：{qq}"
 
 
 def _napcat_acl_pre_tool_call(tool_name: str, **_: Any) -> dict | None:
@@ -645,8 +645,8 @@ class NapCatAdapter(BasePlatformAdapter):
 
         # In group chats Hermes gateway already prefixes stored messages with
         # source.user_name so shared group sessions can distinguish speakers.
-        # Use a stable identity label (role + QQ + nickname), not just a mutable
-        # group card. Do not add another adapter-level prefix here, otherwise
+        # Use a stable identity label (role + QQ only), never a mutable nickname
+        # or group card. Do not add another adapter-level prefix here, otherwise
         # Desktop history shows duplicate prefixes. Some QQ / NapCat event paths
         # already include a prefix in the extracted text; strip that copy and let
         # the gateway add exactly one display prefix. Keep slash commands
