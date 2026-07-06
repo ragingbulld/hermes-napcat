@@ -156,12 +156,12 @@ def _sender_identity_label(role: str, user_id: str, display_name: str) -> str:
 
     QQ nicknames/cards are user-controlled and can collide, so they are not
     included in the model-visible identity.  The gateway will wrap this label in
-    brackets, producing e.g. ``[权限：user；QQ：123456]``.
+    brackets, producing e.g. ``[user:123456]``.
     """
     _ = display_name  # Deliberately ignored: display names are not authority.
     role_label = {"owner": "owner", "admin": "admin", "user": "user"}.get(role, "user")
     qq = _safe_identity_part(user_id, max_len=20) or "unknown"
-    return f"权限：{role_label}；QQ：{qq}"
+    return f"{role_label}:{qq}"
 
 
 def _napcat_acl_pre_tool_call(tool_name: str, **_: Any) -> dict | None:
