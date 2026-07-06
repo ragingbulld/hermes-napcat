@@ -411,7 +411,23 @@ class NapCatAdapter(BasePlatformAdapter):
 
     @property
     def enforces_own_access_policy(self) -> bool:
-        """NapCat gates messages with dm_policy/group_policy before dispatch."""
+        """NapCat gates messages before dispatch.
+
+        Group messages must come from a configured group_allow_chats entry;
+        private messages must come from owner/admin QQ numbers.
+        """
+        return True
+
+    @property
+    def authorization_is_upstream(self) -> bool:
+        """Treat messages that reach the gateway as already NapCat-authorized.
+
+        The generic gateway env allowlists are sender-scoped and would block
+        ordinary members in an allowlisted QQ group.  NapCat needs a mixed
+        policy instead: group allowlist is chat-scoped and DMs are owner/admin
+        only.  _process_message() enforces that before calling handle_message(),
+        so the gateway should not apply a second sender allowlist to NapCat.
+        """
         return True
 
     def __init__(self, config: PlatformConfig) -> None:
