@@ -152,17 +152,16 @@ def _safe_identity_part(value: str, *, max_len: int = 32) -> str:
 
 
 def _sender_identity_label(role: str, user_id: str, display_name: str) -> str:
-    """Return the model-visible sender label used by shared group sessions.
+    """Return the model-visible sender prefix used by shared group sessions.
 
     QQ nicknames/cards are user-controlled and can collide, so they are not
-    included in the model-visible identity.  Make the label explicitly describe
-    the *speaker*, not the target of an action, e.g.
-    ``[发言者身份=owner;QQ=123456]``.
+    included in the model-visible identity.  Use an MC-chat-like speaker prefix,
+    e.g. ``[owner]<123456>``, to make it obvious this is who is speaking.
     """
     _ = display_name  # Deliberately ignored: display names are not authority.
     role_label = {"owner": "owner", "admin": "admin", "user": "user"}.get(role, "user")
     qq = _safe_identity_part(user_id, max_len=20) or "unknown"
-    return f"发言者身份={role_label};QQ={qq}"
+    return f"[{role_label}]<{qq}>"
 
 
 def _napcat_acl_pre_tool_call(tool_name: str, **_: Any) -> dict | None:
@@ -644,24 +643,27 @@ class NapCatAdapter(BasePlatformAdapter):
         image_urls = _extract_images(segments)
         record_url = _extract_record(segments)
 
-        # In group chats Hermes gateway already prefixes stored messages with
-        # source.user_name so shared group sessions can distinguish speakers.
-        # Use a stable identity label (role + QQ only), never a mutable nickname
-        # or group card. Do not add another adapter-level prefix here, otherwise
-        # Desktop history shows duplicate prefixes. Some QQ / NapCat event paths
-        # already include a prefix in the extracted text; strip that copy and let
-        # the gateway add exactly one display prefix. Keep slash commands
-        # starting with "/" so the gateway command parser still recognizes them.
+        # In group chats, add a model-visible speaker prefix ourselves in the
+        # MC-like form `[role]<QQ> message`, then leave source.user_name empty
+        # so the Hermes gateway does not add its own `[source.user_name]` wrapper.
+        # Use only role + QQ: nicknames/cards are mutable and not authority.
+        # Some QQ / NapCat event paths already include a prefix in the extracted
+        # text; strip that copy first. Keep slash commands starting with `/` so
+        # the gateway command parser still recognizes them.
         if is_group and text:
             stripped_text = text.lstrip()
             if stripped_text.startswith("/"):
                 text = stripped_text
             else:
-                # Strip legacy/raw nickname prefixes if NapCat text already
-                # includes one.  The canonical prefix is now source.user_name,
-                # which includes role + QQ number + nickname.
-                for prefix_name in (sender_name, identity_label):
-                    sender_prefix = f"[{prefix_name}]"
+                # Strip legacy/raw nickname prefixes and previous stable
+                # identity-prefix variants if NapCat text already includes one.
+                candidate_prefixes = (
+                    f"[{sender_name}]",
+                    identity_label,
+                    f"[发言者身份={role};QQ={sender_id}]",
+                    f"[{role}:{sender_id}]",
+                )
+                for sender_prefix in candidate_prefixes:
                     if stripped_text.startswith(f"{sender_prefix}:"):
                         text = stripped_text[len(sender_prefix) + 1:].lstrip()
                         break
@@ -688,10 +690,17 @@ class NapCatAdapter(BasePlatformAdapter):
                 q_identity = _sender_identity_label(q_role, q_user_id, q_name)
                 q_text = _extract_text(quoted.get("message", []))
                 if q_text:
-                    reply_text = f"[{q_identity}]: {q_text}"
+                    reply_text = f"{q_identity}: {q_text}"
                     text = f"[引用 {q_identity} 的消息: {q_text}]\n{text}"
             except Exception:
                 pass
+
+        # Prefix normal group messages after quote extraction so the whole
+        # model-visible user turn reads like MC chat: `[owner]<QQ> content`.
+        # Slash commands must stay unprefixed for the gateway command parser.
+        if is_group and text and not text.lstrip().startswith("/"):
+            if not text.startswith(identity_label):
+                text = f"{identity_label} {text}"
 
         # Determine MessageType and media
         media_urls: list[str] = []
@@ -738,7 +747,10 @@ class NapCatAdapter(BasePlatformAdapter):
             chat_name=sender_name if not is_group else group_id,
             chat_type="group" if is_group else "dm",
             user_id=sender_id,
-            user_name=identity_label,
+            # Group messages are manually prefixed as `[role]<QQ> ...` above.
+            # Leaving user_name empty prevents the gateway from wrapping the
+            # prefix again as `[[role]<QQ>] ...`.
+            user_name="" if is_group else identity_label,
         )
 
         role_zh = {"owner": "所有者", "admin": "管理员", "user": "普通用户"}.get(role, "普通用户")
