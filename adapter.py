@@ -141,6 +141,29 @@ def _role_for_user(user_id: str, owners: set[str], admins: set[str]) -> str:
     return "user"
 
 
+def _safe_identity_part(value: str, *, max_len: int = 32) -> str:
+    """Keep sender labels compact and bracket-safe for gateway prefixes."""
+    cleaned = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+    cleaned = cleaned.replace("[", "［").replace("]", "］")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[: max_len - 1] + "…"
+    return cleaned
+
+
+def _sender_identity_label(role: str, user_id: str, display_name: str) -> str:
+    """Return the model-visible sender label used by shared group sessions.
+
+    QQ nicknames/cards are user-controlled and can collide.  Prefixing the
+    stable QQ number and NapCat role helps the model avoid mixing up speakers
+    and avoid attempting tools for ordinary group users.
+    """
+    role_label = {"owner": "owner", "admin": "admin", "user": "user"}.get(role, "user")
+    qq = _safe_identity_part(user_id, max_len=20) or "unknown"
+    name = _safe_identity_part(display_name, max_len=32)
+    return f"{role_label} QQ:{qq} {name}" if name else f"{role_label} QQ:{qq}"
+
+
 def _napcat_acl_pre_tool_call(tool_name: str, **_: Any) -> dict | None:
     """Hard tool permission gate for NapCat sessions."""
     try:
@@ -594,6 +617,7 @@ class NapCatAdapter(BasePlatformAdapter):
         owners = set(self._owners)
         admins = set(self._admins)
         role = _role_for_user(sender_id, owners, admins)
+        identity_label = _sender_identity_label(role, sender_id, sender_name)
         if is_group:
             if not self._group_allow_chats or group_id not in self._group_allow_chats:
                 return
@@ -620,23 +644,29 @@ class NapCatAdapter(BasePlatformAdapter):
         record_url = _extract_record(segments)
 
         # In group chats Hermes gateway already prefixes stored messages with
-        # source.user_name (e.g. "[name] message") so shared group sessions can
-        # distinguish speakers. Do not add another adapter-level prefix here,
-        # otherwise Desktop history shows "[name] [name]: message". Some QQ /
-        # NapCat event paths already include "[name]:" in the extracted text;
-        # strip that copy and let the gateway add exactly one display prefix.
-        # Keep slash commands starting with "/" so the gateway command parser
-        # still recognizes them.
+        # source.user_name so shared group sessions can distinguish speakers.
+        # Use a stable identity label (role + QQ + nickname), not just a mutable
+        # group card. Do not add another adapter-level prefix here, otherwise
+        # Desktop history shows duplicate prefixes. Some QQ / NapCat event paths
+        # already include a prefix in the extracted text; strip that copy and let
+        # the gateway add exactly one display prefix. Keep slash commands
+        # starting with "/" so the gateway command parser still recognizes them.
         if is_group and text:
             stripped_text = text.lstrip()
             if stripped_text.startswith("/"):
                 text = stripped_text
             else:
-                sender_prefix = f"[{sender_name}]"
-                if stripped_text.startswith(f"{sender_prefix}:"):
-                    text = stripped_text[len(sender_prefix) + 1:].lstrip()
-                elif stripped_text.startswith(sender_prefix):
-                    text = stripped_text[len(sender_prefix):].lstrip()
+                # Strip legacy/raw nickname prefixes if NapCat text already
+                # includes one.  The canonical prefix is now source.user_name,
+                # which includes role + QQ number + nickname.
+                for prefix_name in (sender_name, identity_label):
+                    sender_prefix = f"[{prefix_name}]"
+                    if stripped_text.startswith(f"{sender_prefix}:"):
+                        text = stripped_text[len(sender_prefix) + 1:].lstrip()
+                        break
+                    if stripped_text.startswith(sender_prefix):
+                        text = stripped_text[len(sender_prefix):].lstrip()
+                        break
                 else:
                     text = stripped_text
 
@@ -647,15 +677,18 @@ class NapCatAdapter(BasePlatformAdapter):
             try:
                 quoted = await get_msg(self._http_api, reply_id, self._access_token or None)
                 q_sender = quoted.get("sender", {})
+                q_user_id = str(q_sender.get("user_id", "") or "")
                 q_name = (
                     q_sender.get("card")
                     or q_sender.get("nickname")
-                    or str(q_sender.get("user_id", ""))
+                    or q_user_id
                 )
+                q_role = _role_for_user(q_user_id, owners, admins)
+                q_identity = _sender_identity_label(q_role, q_user_id, q_name)
                 q_text = _extract_text(quoted.get("message", []))
                 if q_text:
-                    reply_text = f"[{q_name}]: {q_text}"
-                    text = f"[引用 {q_name} 的消息: {q_text}]\n{text}"
+                    reply_text = f"[{q_identity}]: {q_text}"
+                    text = f"[引用 {q_identity} 的消息: {q_text}]\n{text}"
             except Exception:
                 pass
 
@@ -704,7 +737,7 @@ class NapCatAdapter(BasePlatformAdapter):
             chat_name=sender_name if not is_group else group_id,
             chat_type="group" if is_group else "dm",
             user_id=sender_id,
-            user_name=sender_name,
+            user_name=identity_label,
         )
 
         role_zh = {"owner": "所有者", "admin": "管理员", "user": "普通用户"}.get(role, "普通用户")
