@@ -139,6 +139,10 @@ def _role_for_user(user_id: str, owners: set[str], admins: set[str]) -> str:
     return "user"
 
 
+def _is_slash_command(content: str) -> bool:
+    return bool(re.match(r"^\s*/[A-Za-z][\w-]*(?:\s|$)", content or ""))
+
+
 def _safe_identity_part(value: str, *, max_len: int = 32) -> str:
     """Keep sender labels compact and bracket-safe for gateway prefixes."""
     cleaned = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
@@ -687,6 +691,21 @@ class NapCatAdapter(BasePlatformAdapter):
         if is_group and mentioned and not text.strip() and not image_urls and not record_url:
             text = "hi"
 
+        if role == "user" and _is_slash_command(text):
+            logger.info(
+                "NapCat blocked slash command from ordinary user: chat=%s user=%s command=%s",
+                chat_id,
+                sender_id,
+                text.split(maxsplit=1)[0][:80],
+            )
+            original_message_id = str(event.get("message_id", "") or "")
+            await self.send(
+                chat_id,
+                "普通用户不能使用指令，请直接用普通聊天提问。",
+                reply_to=original_message_id or None,
+            )
+            return
+
         # In group chats, add a model-visible speaker prefix ourselves in the
         # MC-like form `[role]<QQ> message`, then leave source.user_name empty
         # so the Hermes gateway does not add its own `[source.user_name]` wrapper.
@@ -808,7 +827,7 @@ class NapCatAdapter(BasePlatformAdapter):
             )
         else:
             permission_detail = (
-                "你是普通用户：只能普通聊天，不能调用任何工具；不得执行本地命令、读写本机文件、修改配置、写入记忆、修改用户画像记忆或进行 QQ 管理操作。"
+                "你是普通用户：只能普通聊天，不能调用任何工具，也不能使用 /new、/reset、/approve 等 slash 指令；不得执行本地命令、读写本机文件、修改配置、写入记忆、修改用户画像记忆或进行 QQ 管理操作。"
             )
         privacy_prompt = ""
         if is_group:
