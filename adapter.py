@@ -766,11 +766,20 @@ class NapCatAdapter(BasePlatformAdapter):
             permission_detail = (
                 "你是普通用户：只能普通聊天和使用公开查询/图片理解类工具；不得执行本地命令、读写本机文件、修改配置、写入记忆、修改用户画像记忆或进行 QQ 管理操作。"
             )
+        privacy_prompt = ""
+        if is_group:
+            privacy_prompt = (
+                "群聊隐私规则：USER PROFILE、长期记忆和画像默认属于 owner 本人，而不是群里所有发言者。"
+                "在群聊回复中不得披露 owner 的个人画像或私密记忆，包括但不限于生日、学校/求职信息、健康/戒色/习惯偏好、家庭住址/位置、账号/内网/服务器细节、个人喜好画像等。"
+                "可以在不明说隐私内容的前提下内部参考非敏感偏好来改善回答；如用户要求查看/复述/确认 owner 个人信息或私密记忆，应拒绝并建议 owner 私聊。"
+                "权限信息本身只可按当前前缀/QQ 简要判断，不得把 owner 画像套到 admin 或普通群友身上。"
+            )
         permission_prompt = (
             f"[{role_zh}] QQ:{sender_id}。"
             "权限身份仅按 QQ 号判定，不按昵称/群名片判定。"
             f"{permission_detail}"
             "读取公开网页/回答普通问题可直接处理；涉及越权工具时必须拒绝或让用户联系 owner/admin。"
+            f"{privacy_prompt}"
         )
 
         message_event = MessageEvent(
