@@ -463,6 +463,18 @@ class NapCatAdapter(BasePlatformAdapter):
         # Treat placeholder values as empty so HTTP probe fills in real QQ
         self._self_id: str = "" if raw_self_id in ("YOUR_QQ_NUMBER", "YOURQQ_NUMBER") else raw_self_id
         self._ws_port: int = int(extra.get("ws_port", 18800))
+        source_platform = str(extra.get("desktop_source_platform") or "napcat").strip().lower()
+        # Display/session source alias for Hermes Desktop. Keep the adapter
+        # registered as napcat so transport/tools still use OneBot; only the
+        # persisted SessionSource changes. Accept identifier-ish values only to
+        # avoid malformed session keys from config typos.
+        if not source_platform.replace("_", "").replace("-", "").isalnum():
+            source_platform = "napcat"
+        try:
+            self._source_platform = Platform(source_platform)
+        except Exception:
+            logger.warning("NapCat: invalid desktop_source_platform=%r; using napcat", source_platform)
+            self._source_platform = self.platform
         self._owners: list[str] = _as_str_list(extra.get("owners") or extra.get("owner"))
         self._admins: list[str] = _as_str_list(extra.get("admins"))
         self._group_allow_chats: list[str] = [
@@ -742,7 +754,7 @@ class NapCatAdapter(BasePlatformAdapter):
             await self._mark_processing(original_message_id)
 
         source = SessionSource(
-            platform=Platform("napcat"),
+            platform=self._source_platform,
             chat_id=chat_id,
             chat_name=sender_name if not is_group else group_id,
             chat_type="group" if is_group else "dm",
