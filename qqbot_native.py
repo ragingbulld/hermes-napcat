@@ -621,6 +621,99 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             logger.warning("QQBot Native found %d image candidate(s), but none could be downloaded", len(candidates))
         return paths, media_types
 
+    @staticmethod
+    def _detect_message_type(media_urls: list[str], media_types: list[str]) -> MessageType:
+        """Mirror Hermes' built-in qqbot attachment → MessageType behavior."""
+        if not media_urls:
+            return MessageType.TEXT
+        if not media_types:
+            return MessageType.PHOTO
+        first_type = (media_types[0] or "").lower()
+        if "video" in first_type:
+            return MessageType.VIDEO
+        if "image" in first_type or "photo" in first_type:
+            return MessageType.PHOTO
+        if "audio" in first_type or "voice" in first_type or "silk" in first_type:
+            return MessageType.VOICE
+        return MessageType.TEXT
+
+    @staticmethod
+    def _attachment_url(att: dict[str, Any]) -> str:
+        for key in ("url", "file_url", "fileUrl", "download_url", "downloadUrl", "uri"):
+            raw = str(att.get(key) or "").strip()
+            if raw.startswith("//"):
+                return f"https:{raw}"
+            if raw:
+                return raw
+        return ""
+
+    async def _process_attachments(self, attachments: Any) -> dict[str, Any]:
+        """Process standard official QQBot attachments like the built-in adapter.
+
+        Image attachments are downloaded and cached into local `media_urls`.
+        Non-image attachments are preserved as short text notes; rich-media
+        placeholders embedded in `content` are handled by `_process_event_media`.
+        """
+        if not isinstance(attachments, list):
+            return {"image_urls": [], "image_media_types": [], "attachment_info": ""}
+
+        image_urls: list[str] = []
+        image_media_types: list[str] = []
+        other_attachments: list[str] = []
+
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            ct = str(
+                att.get("content_type")
+                or att.get("contentType")
+                or att.get("mime_type")
+                or att.get("mimeType")
+                or ""
+            ).strip().lower()
+            filename = str(att.get("filename") or att.get("file_name") or att.get("name") or "")
+            url = self._attachment_url(att)
+            if not url:
+                continue
+            if ct.startswith("image/") or filename.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")) or _looks_like_image_url(url):
+                paths, types = await self._download_image_candidates([(url, ct or "image/jpeg")])
+                image_urls.extend(paths)
+                image_media_types.extend(types)
+            else:
+                label = filename or ct or "attachment"
+                other_attachments.append(f"[file: {label}]")
+
+        return {
+            "image_urls": image_urls,
+            "image_media_types": image_media_types,
+            "attachment_info": "\n".join(other_attachments),
+        }
+
+    async def _process_event_media(self, payload: dict[str, Any], content: str) -> tuple[list[str], list[str], str]:
+        """Return `(media_urls, media_types, attachment_info)` for a QQBot event."""
+        att_result = await self._process_attachments(payload.get("attachments"))
+        media_urls = list(att_result["image_urls"])
+        media_types = list(att_result["image_media_types"])
+        attachment_info = str(att_result.get("attachment_info") or "")
+
+        fallback_payload = {k: v for k, v in payload.items() if k != "attachments"}
+        fallback_candidates = self._extract_image_candidates(fallback_payload, content)
+        fallback_urls, fallback_types = await self._download_image_candidates(fallback_candidates)
+        seen = set(media_urls)
+        for path, mime in zip(fallback_urls, fallback_types):
+            if path not in seen:
+                seen.add(path)
+                media_urls.append(path)
+                media_types.append(mime)
+        return media_urls, media_types, attachment_info
+
+    @staticmethod
+    def _append_attachment_info(text: str, attachment_info: str) -> str:
+        info = (attachment_info or "").strip()
+        if not info:
+            return text
+        return f"{text}\n\n{info}".strip() if text.strip() else info
+
     async def _on_message(self, event_type: str, d: Any) -> None:
         if not isinstance(d, dict):
             return
@@ -635,17 +728,18 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         if event_type == "C2C_MESSAGE_CREATE":
             user_openid = str(author.get("user_openid") or author.get("id") or "").strip()
             if user_openid and self._dm_allowed(user_openid):
-                media_urls, media_types = await self._download_image_candidates(self._extract_image_candidates(d, content))
+                media_urls, media_types, attachment_info = await self._process_event_media(d, content)
                 await self._emit_event(
                     "c2c",
                     user_openid,
                     user_openid,
-                    content,
+                    self._append_attachment_info(content, attachment_info),
                     msg_id,
                     timestamp,
                     raw_payload=d,
                     media_urls=media_urls,
                     media_types=media_types,
+                    message_type=self._detect_message_type(media_urls, media_types),
                 )
             elif user_openid:
                 logger.info("QQBot Native ignored C2C message from unallowed openid=%s", user_openid)
@@ -655,17 +749,18 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             group_openid = str(d.get("group_openid") or "").strip()
             member_openid = str(author.get("member_openid") or author.get("user_openid") or "").strip()
             if group_openid and self._group_allowed(group_openid):
-                media_urls, media_types = await self._download_image_candidates(self._extract_image_candidates(d, content))
+                media_urls, media_types, attachment_info = await self._process_event_media(d, content)
                 await self._emit_event(
                     "group",
                     group_openid,
                     member_openid,
-                    self._strip_at_mention(content),
+                    self._append_attachment_info(self._strip_at_mention(content), attachment_info),
                     msg_id,
                     timestamp,
                     raw_payload=d,
                     media_urls=media_urls,
                     media_types=media_types,
+                    message_type=self._detect_message_type(media_urls, media_types),
                 )
             elif group_openid:
                 logger.info(
@@ -680,18 +775,19 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             guild_id = str(d.get("guild_id") or "").strip()
             user_id = str(author.get("id") or "").strip()
             if channel_id and self._group_allowed(guild_id or channel_id):
-                media_urls, media_types = await self._download_image_candidates(self._extract_image_candidates(d, content))
+                media_urls, media_types, attachment_info = await self._process_event_media(d, content)
                 await self._emit_event(
                     "guild",
                     channel_id,
                     user_id,
-                    content,
+                    self._append_attachment_info(content, attachment_info),
                     msg_id,
                     timestamp,
                     guild_id=guild_id,
                     raw_payload=d,
                     media_urls=media_urls,
                     media_types=media_types,
+                    message_type=self._detect_message_type(media_urls, media_types),
                 )
             elif channel_id:
                 logger.info(
@@ -706,17 +802,18 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             guild_id = str(d.get("guild_id") or "").strip()
             user_id = str(author.get("id") or "").strip()
             if guild_id and self._dm_allowed(user_id):
-                media_urls, media_types = await self._download_image_candidates(self._extract_image_candidates(d, content))
+                media_urls, media_types, attachment_info = await self._process_event_media(d, content)
                 await self._emit_event(
                     "dm",
                     guild_id,
                     user_id,
-                    content,
+                    self._append_attachment_info(content, attachment_info),
                     msg_id,
                     timestamp,
                     raw_payload=d,
                     media_urls=media_urls,
                     media_types=media_types,
+                    message_type=self._detect_message_type(media_urls, media_types),
                 )
             elif guild_id or user_id:
                 logger.info(
@@ -738,6 +835,7 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         raw_payload: dict[str, Any] | None = None,
         media_urls: list[str] | None = None,
         media_types: list[str] | None = None,
+        message_type: MessageType | None = None,
     ) -> None:
         media_urls = media_urls or []
         media_types = media_types or []
@@ -773,7 +871,7 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         event = MessageEvent(
             source=source,
             text=visible,
-            message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
+            message_type=message_type or self._detect_message_type(media_urls, media_types),
             raw_message={"chat_kind": chat_kind, "payload": raw_payload or {}},
             message_id=message_id,
             media_urls=media_urls,
