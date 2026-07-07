@@ -929,6 +929,15 @@ class NapCatAdapter(BasePlatformAdapter):
         if outcome is not ProcessingOutcome.SUCCESS:
             return
         message_id = getattr(event, "message_id", None)
+        original_message_id = getattr(event, "_hermes_original_message_id", None)
+        if original_message_id and str(original_message_id) != str(message_id or ""):
+            # A queued follow-up may become the visible final reply target while
+            # the outer event was an older message.  Clear the stale processing
+            # reaction on the older message so QQ does not appear to complete the
+            # wrong item; mark completion on the actual final reply target below.
+            await self._clear_processing(str(original_message_id))
+            self._post_reply_reactions.discard(str(original_message_id))
+            self._post_reply_pokes.pop(str(original_message_id), None)
         await self._clear_processing(message_id)
         await self._mark_post_response(message_id)
 
