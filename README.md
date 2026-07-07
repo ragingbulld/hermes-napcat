@@ -10,11 +10,12 @@ Out-of-tree Hermes Agent platform plugin for QQ via [NapCat](https://github.com/
 - Reverse WebSocket listener for NapCat events
 - OneBot 11 HTTP API client for sending text, images, voice, video, and files
 - `qq_*` toolset for QQ messaging, group management, OCR, translation, reactions, notices, and files
-- QQ-number based owner/admin/user ACL for tool calls
+- QQ-number based owner/admin/user ACL for NapCat tool calls
 - Optional group mention requirement
 - Processing and post-response QQ emoji reactions
 - Private-chat typing indicator support
-- Plain-text formatting for QQ, because QQ does not render Markdown
+- Plain-text formatting for NapCat QQ, because ordinary QQ does not render Markdown
+- Optional plugin-local `qqbot_native` platform for official QQBot access with native Markdown output
 
 ## Requirements
 
@@ -92,26 +93,55 @@ NapCat should connect to:
 ws://<hermes-host>:18800
 ```
 
+## Optional official QQBot native platform
+
+The plugin can also register a separate `qqbot_native` platform. This is not
+Hermes' built-in `qqbot` adapter; it lives inside this plugin and keeps official
+QQBot support out of Hermes core. Use it when you want official QQBot native
+Markdown rendering. Official QQBot uses OpenID identities, not normal QQ
+numbers.
+
+```yaml
+platforms:
+  qqbot_native:
+    enabled: false   # flip to true only after app credentials are ready
+    extra:
+      app_id: ""
+      client_secret: ""
+      markdown_support: true
+
+      # OpenIDs, not QQ numbers.
+      owners: []
+      admins: []
+
+      dm_policy: allowlist
+      allow_from: []
+
+      group_policy: allowlist
+      group_allow_chats: []
+```
+
 ## Access control
 
 The plugin has two layers:
 
-1. Reply/session access, configured by your Hermes Gateway/NapCat platform settings.
+1. Reply/session access, configured by your Hermes Gateway/NapCat or QQBot Native platform settings.
 2. Tool-call ACL enforced by this plugin.
 
 Tool roles:
 
 - `owners`: full access, including memory/profile-sensitive tools.
 - `admins`: may use admin/dangerous QQ tools, but not owner-only memory/profile tools.
-- ordinary users: restricted to a small safe public-query tool set unless you change the code/config.
+- ordinary users: may chat when allowed by the reply ACL, but cannot call any tools by default.
 
-Do not put real tokens, QQ IDs, group IDs, or deployment IPs in this repository. Keep secrets in `~/.hermes/config.yaml` or `~/.hermes/.env` on your own machine.
+Do not put real tokens, QQ IDs, group IDs, OpenIDs, or deployment IPs in this repository. Keep secrets in `~/.hermes/config.yaml` or `~/.hermes/.env` on your own machine.
 
 ## Repository layout
 
 ```text
 adapter.py      # Hermes Gateway platform adapter and plugin registration
 napcat_api.py   # Minimal async OneBot 11 HTTP client
+qqbot_native.py # Plugin-local official QQBot adapter with native Markdown
 qq_tool.py      # Hermes qq_* tool registrations
 plugin.yaml     # Hermes plugin metadata
 ```

@@ -82,9 +82,7 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".ico"
 _OWNER_ONLY_TOOLS = {
     "memory", "fact_store", "fact_feedback",
 }
-_USER_ALLOWED_TOOLS = {
-    "web_search", "web_extract", "vision_analyze",
-}
+_USER_ALLOWED_TOOLS: set[str] = set()
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -373,6 +371,24 @@ def _strip_bot_mention(segments: list[dict], self_id: str) -> list[dict]:
     ]
 
 
+def _strip_textual_bot_mention(text: str, names: list[str]) -> tuple[bool, str]:
+    """Accept QQ clients that emit ``@[灵溪] text`` as plain text.
+
+    Real QQ mentions arrive as CQ ``at`` segments and are preferred. Some clients
+    or copy/paste paths produce a literal text prefix like ``@[灵溪] 出来说话``;
+    treat only a leading explicit @name as a mention so ordinary text such as
+    ``问下灵溪`` still does not trigger when ``require_mention`` is enabled.
+    """
+    raw = str(text or "").lstrip()
+    for name in names:
+        escaped = re.escape(name)
+        pattern = rf"^@\s*(?:\[{escaped}\]|{escaped})(?:\s+|[:,，：、]?\s*)"
+        match = re.match(pattern, raw)
+        if match:
+            return True, raw[match.end():].lstrip()
+    return False, text
+
+
 def _chunk_text(text: str, limit: int = _QQ_TEXT_LIMIT) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -463,18 +479,18 @@ class NapCatAdapter(BasePlatformAdapter):
         # Treat placeholder values as empty so HTTP probe fills in real QQ
         self._self_id: str = "" if raw_self_id in ("YOUR_QQ_NUMBER", "YOURQQ_NUMBER") else raw_self_id
         self._ws_port: int = int(extra.get("ws_port", 18800))
-        source_platform = str(extra.get("desktop_source_platform") or "napcat").strip().lower()
-        # Display/session source alias for Hermes Desktop. Keep the adapter
-        # registered as napcat so transport/tools still use OneBot; only the
-        # persisted SessionSource changes. Accept identifier-ish values only to
-        # avoid malformed session keys from config typos.
-        if not source_platform.replace("_", "").replace("-", "").isalnum():
-            source_platform = "napcat"
-        try:
-            self._source_platform = Platform(source_platform)
-        except Exception:
-            logger.warning("NapCat: invalid desktop_source_platform=%r; using napcat", source_platform)
-            self._source_platform = self.platform
+        # Keep SessionSource.platform equal to the real adapter platform.
+        # A previous Desktop grouping workaround aliased NapCat messages as
+        # qqbot, but the gateway then applied qqbot authorization instead of
+        # NapCat's own group ACL.  That caused messages to receive QQ reactions
+        # while the core silently rejected them.  Desktop grouping must be fixed
+        # in UI/session presentation code, not by changing runtime platform id.
+        if extra.get("desktop_source_platform") and str(extra.get("desktop_source_platform")).lower() != "napcat":
+            logger.warning(
+                "NapCat: ignoring desktop_source_platform=%r; runtime source platform must remain napcat",
+                extra.get("desktop_source_platform"),
+            )
+        self._source_platform = self.platform
         self._owners: list[str] = _as_str_list(extra.get("owners") or extra.get("owner"))
         self._admins: list[str] = _as_str_list(extra.get("admins"))
         self._group_allow_chats: list[str] = [
@@ -487,6 +503,7 @@ class NapCatAdapter(BasePlatformAdapter):
         ]
         # Group trigger policy. Current deployment wants group messages to
         # mention the bot before Hermes replies; DMs still use sender allowlist.
+        self._mention_names: list[str] = _as_str_list(extra.get("mention_names")) or ["灵溪", "灵溪灵溪灵"]
         self._require_mention: bool = _as_bool(
             extra.get("group_require_mention", extra.get("require_mention", False)),
             default=False,
@@ -609,6 +626,8 @@ class NapCatAdapter(BasePlatformAdapter):
         group_id = str(event.get("group_id", "")) if is_group else ""
         chat_id = f"group:{group_id}" if is_group else sender_id
         segments: list[dict] = event.get("message", [])
+        mentioned = False
+        textual_mention_text: str | None = None
 
         # Group mention handling. This deployment gates groups by both sender
         # allowlist and @ mention; DMs still use only the sender allowlist.
@@ -616,6 +635,14 @@ class NapCatAdapter(BasePlatformAdapter):
         # users to trigger the bot in groups without @.
         if is_group:
             mentioned = bool(self._self_id and _has_bot_mention(segments, self._self_id))
+            if not mentioned:
+                textual_mentioned, stripped = _strip_textual_bot_mention(
+                    _extract_text(segments),
+                    self._mention_names,
+                )
+                if textual_mentioned:
+                    mentioned = True
+                    textual_mention_text = stripped
             if self._require_mention and self._self_id and not mentioned:
                 return
             if self._self_id and mentioned:
@@ -652,8 +679,13 @@ class NapCatAdapter(BasePlatformAdapter):
             return
 
         text = _extract_text(segments)
+        if textual_mention_text is not None:
+            text = textual_mention_text
         image_urls = _extract_images(segments)
         record_url = _extract_record(segments)
+
+        if is_group and mentioned and not text.strip() and not image_urls and not record_url:
+            text = "hi"
 
         # In group chats, add a model-visible speaker prefix ourselves in the
         # MC-like form `[role]<QQ> message`, then leave source.user_name empty
@@ -776,7 +808,7 @@ class NapCatAdapter(BasePlatformAdapter):
             )
         else:
             permission_detail = (
-                "你是普通用户：只能普通聊天和使用公开查询/图片理解类工具；不得执行本地命令、读写本机文件、修改配置、写入记忆、修改用户画像记忆或进行 QQ 管理操作。"
+                "你是普通用户：只能普通聊天，不能调用任何工具；不得执行本地命令、读写本机文件、修改配置、写入记忆、修改用户画像记忆或进行 QQ 管理操作。"
             )
         privacy_prompt = ""
         if is_group:
@@ -1200,8 +1232,10 @@ def register(ctx) -> None:
     # Importing this module registers qq_* tools into the dynamic "napcat"
     # toolset. The adapter initializes its HTTP endpoint/admin context at runtime.
     from . import qq_tool as _qq_tool  # noqa: F401
+    from .qqbot_native import register_qqbot_native
 
     ctx.register_hook("pre_tool_call", _napcat_acl_pre_tool_call)
+    register_qqbot_native(ctx)
 
     ctx.register_platform(
         name="napcat",

@@ -5,6 +5,7 @@ version: 0.1.0
 description: >
   Out-of-tree Hermes Agent gateway adapter for QQ via NapCat / OneBot 11 reverse WebSocket.
   Supports sender allowlists for both private chats and groups without modifying Hermes core source.
+  Also includes an optional plugin-local qqbot_native platform for official QQBot native Markdown.
 author: ragingbulld
 optional_env:
   - name: NAPCAT_ALLOWED_USERS
