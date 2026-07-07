@@ -16,9 +16,12 @@ be layered on later without changing Hermes core.
 from __future__ import annotations
 
 import asyncio
+import base64
 from contextlib import suppress
+import html
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
@@ -30,7 +33,7 @@ from typing import Any, Optional
 import aiohttp
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult, cache_image_from_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +47,24 @@ MAX_MESSAGE_LENGTH = 4000
 DEFAULT_API_TIMEOUT = aiohttp.ClientTimeout(total=30)
 LAST_MESSAGE_STATE_PATH = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser() / "qqbot_native_last_messages.json"
 PASSIVE_REPLY_WINDOW_SECONDS = 5 * 60
+IMAGE_URL_KEYS = {
+    "url",
+    "uri",
+    "src",
+    "file",
+    "file_url",
+    "fileUrl",
+    "image_url",
+    "imageUrl",
+    "file_image",
+    "fileImage",
+    "pic_url",
+    "picUrl",
+    "origin_url",
+    "originUrl",
+    "download_url",
+    "downloadUrl",
+}
 
 # Keep this separate from NapCat's QQ-number ACL. Official QQBot exposes OpenIDs.
 _OWNER_ONLY_TOOLS = {"memory", "fact_store", "fact_feedback"}
@@ -127,6 +148,45 @@ def _sender_identity_label(role: str, user_id: str) -> str:
     role_label = {"owner": "owner", "admin": "admin", "user": "user"}.get(role, "user")
     oid = _safe_identity_part(user_id, max_len=32) or "unknown"
     return f"[{role_label}]<{oid}>"
+
+
+def _guess_image_ext(url: str, content_type: str = "") -> str:
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if ctype:
+        ext = mimetypes.guess_extension(ctype)
+        if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+            return ".jpg" if ext == ".jpeg" else ext
+    path = url.split("?", 1)[0].lower()
+    for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
+        if path.endswith(ext):
+            return ".jpg" if ext == ".jpeg" else ext
+    return ".jpg"
+
+
+def _looks_like_image_url(url: str) -> bool:
+    lowered = str(url or "").lower()
+    if not lowered.startswith(("http://", "https://")):
+        return False
+    if any(lowered.split("?", 1)[0].endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
+        return True
+    # Official QQ group image URLs are often temporary download endpoints with
+    # no image extension, e.g. multimedia.nt.qq.com.cn/download?... .
+    return "multimedia.nt.qq.com" in lowered or "gchat.qpic.cn" in lowered or "qpic.cn" in lowered
+
+
+def _decode_qqbot_ext_payload(value: str) -> Any | None:
+    raw = html.unescape(str(value or "").strip())
+    if not raw:
+        return None
+    padding = "=" * (-len(raw) % 4)
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            decoded = decoder((raw + padding).encode())
+            text = decoded.decode("utf-8", errors="replace").strip()
+            return json.loads(text)
+        except Exception:
+            continue
+    return None
 
 
 def qqbot_native_acl_pre_tool_call(tool_name: str, **_: Any) -> dict | None:
@@ -472,6 +532,95 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             return msg_id
         return None
 
+    def _collect_image_candidates(self, value: Any, *, inherited_mime: str = "", image_hint: bool = False) -> list[tuple[str, str]]:
+        """Collect possible official QQBot image URLs from nested event data."""
+        found: list[tuple[str, str]] = []
+        if isinstance(value, list):
+            for item in value:
+                found.extend(self._collect_image_candidates(item, inherited_mime=inherited_mime, image_hint=image_hint))
+            return found
+        if not isinstance(value, dict):
+            return found
+
+        mime = str(
+            value.get("content_type")
+            or value.get("contentType")
+            or value.get("mime_type")
+            or value.get("mimeType")
+            or inherited_mime
+            or ""
+        ).strip()
+        filename = str(value.get("filename") or value.get("file_name") or value.get("name") or "")
+        local_image_hint = image_hint or mime.lower().startswith("image/") or filename.lower().endswith(
+            (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+        )
+
+        for key, item in value.items():
+            if isinstance(item, str) and key in IMAGE_URL_KEYS:
+                url = item.strip()
+                if url.startswith(("http://", "https://")) and (local_image_hint or _looks_like_image_url(url)):
+                    found.append((url, mime or "image/jpeg"))
+            elif isinstance(item, (dict, list)):
+                found.extend(self._collect_image_candidates(item, inherited_mime=mime, image_hint=local_image_hint))
+        return found
+
+    def _image_candidates_from_content(self, content: str) -> list[tuple[str, str]]:
+        found: list[tuple[str, str]] = []
+        # Official QQ group rich-media placeholders can look like:
+        # <faceType=6,faceId="0",ext="<base64-json>">.  The ext JSON may carry
+        # a temporary image URL even when the message has no attachments field.
+        for match in re.finditer(r'\bext=(?:"([^"]+)"|\'([^\']+)\')', content or ""):
+            payload = _decode_qqbot_ext_payload(match.group(1) or match.group(2) or "")
+            if payload is not None:
+                found.extend(self._collect_image_candidates(payload, image_hint=True))
+        for match in re.finditer(r"https?://[^\s<>'\"]+", content or ""):
+            url = match.group(0).strip()
+            if _looks_like_image_url(url):
+                found.append((url, "image/jpeg"))
+        return found
+
+    def _extract_image_candidates(self, payload: dict[str, Any], content: str) -> list[tuple[str, str]]:
+        candidates: list[tuple[str, str]] = []
+        for key in ("attachments", "attachment", "images", "image", "media", "file_image"):
+            value = payload.get(key)
+            if isinstance(value, str) and _looks_like_image_url(value):
+                candidates.append((value, "image/jpeg"))
+            else:
+                candidates.extend(self._collect_image_candidates(value))
+        candidates.extend(self._image_candidates_from_content(content))
+        deduped: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for url, mime in candidates:
+            if url not in seen:
+                seen.add(url)
+                deduped.append((url, mime or "image/jpeg"))
+        return deduped
+
+    async def _download_image_candidates(self, candidates: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+        if not candidates:
+            return [], []
+        if not self._session:
+            self._session = aiohttp.ClientSession(trust_env=True)
+        token = await self._ensure_token()
+        paths: list[str] = []
+        media_types: list[str] = []
+        headers = {"Authorization": f"QQBot {token}", "Accept": "image/*,*/*;q=0.8"}
+        for url, hinted_mime in candidates[:4]:
+            try:
+                async with self._session.get(url, headers=headers, timeout=DEFAULT_API_TIMEOUT) as resp:
+                    data = await resp.read()
+                    if resp.status >= 400:
+                        raise RuntimeError(f"HTTP {resp.status}: {data[:160]!r}")
+                    mime = (resp.headers.get("Content-Type") or hinted_mime or "image/jpeg").split(";", 1)[0].strip()
+                path = cache_image_from_bytes(data, _guess_image_ext(url, mime))
+                paths.append(path)
+                media_types.append(mime if mime.startswith("image/") else "image/jpeg")
+            except Exception as exc:
+                logger.warning("QQBot Native image download failed: url=%s error=%s", url[:180], exc)
+        if candidates and not paths:
+            logger.warning("QQBot Native found %d image candidate(s), but none could be downloaded", len(candidates))
+        return paths, media_types
+
     async def _on_message(self, event_type: str, d: Any) -> None:
         if not isinstance(d, dict):
             return
@@ -486,7 +635,18 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         if event_type == "C2C_MESSAGE_CREATE":
             user_openid = str(author.get("user_openid") or author.get("id") or "").strip()
             if user_openid and self._dm_allowed(user_openid):
-                await self._emit_event("c2c", user_openid, user_openid, content, msg_id, timestamp)
+                media_urls, media_types = await self._download_image_candidates(self._extract_image_candidates(d, content))
+                await self._emit_event(
+                    "c2c",
+                    user_openid,
+                    user_openid,
+                    content,
+                    msg_id,
+                    timestamp,
+                    raw_payload=d,
+                    media_urls=media_urls,
+                    media_types=media_types,
+                )
             elif user_openid:
                 logger.info("QQBot Native ignored C2C message from unallowed openid=%s", user_openid)
             return
@@ -495,7 +655,18 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             group_openid = str(d.get("group_openid") or "").strip()
             member_openid = str(author.get("member_openid") or author.get("user_openid") or "").strip()
             if group_openid and self._group_allowed(group_openid):
-                await self._emit_event("group", group_openid, member_openid, self._strip_at_mention(content), msg_id, timestamp)
+                media_urls, media_types = await self._download_image_candidates(self._extract_image_candidates(d, content))
+                await self._emit_event(
+                    "group",
+                    group_openid,
+                    member_openid,
+                    self._strip_at_mention(content),
+                    msg_id,
+                    timestamp,
+                    raw_payload=d,
+                    media_urls=media_urls,
+                    media_types=media_types,
+                )
             elif group_openid:
                 logger.info(
                     "QQBot Native ignored group message from unallowed group_openid=%s member_openid=%s",
@@ -509,7 +680,19 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             guild_id = str(d.get("guild_id") or "").strip()
             user_id = str(author.get("id") or "").strip()
             if channel_id and self._group_allowed(guild_id or channel_id):
-                await self._emit_event("guild", channel_id, user_id, content, msg_id, timestamp, guild_id=guild_id)
+                media_urls, media_types = await self._download_image_candidates(self._extract_image_candidates(d, content))
+                await self._emit_event(
+                    "guild",
+                    channel_id,
+                    user_id,
+                    content,
+                    msg_id,
+                    timestamp,
+                    guild_id=guild_id,
+                    raw_payload=d,
+                    media_urls=media_urls,
+                    media_types=media_types,
+                )
             elif channel_id:
                 logger.info(
                     "QQBot Native ignored guild message from unallowed guild_id=%s channel_id=%s user_id=%s",
@@ -523,7 +706,18 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             guild_id = str(d.get("guild_id") or "").strip()
             user_id = str(author.get("id") or "").strip()
             if guild_id and self._dm_allowed(user_id):
-                await self._emit_event("dm", guild_id, user_id, content, msg_id, timestamp)
+                media_urls, media_types = await self._download_image_candidates(self._extract_image_candidates(d, content))
+                await self._emit_event(
+                    "dm",
+                    guild_id,
+                    user_id,
+                    content,
+                    msg_id,
+                    timestamp,
+                    raw_payload=d,
+                    media_urls=media_urls,
+                    media_types=media_types,
+                )
             elif guild_id or user_id:
                 logger.info(
                     "QQBot Native ignored direct message from unallowed guild_id=%s user_id=%s",
@@ -541,8 +735,14 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         timestamp: datetime | None,
         *,
         guild_id: str | None = None,
+        raw_payload: dict[str, Any] | None = None,
+        media_urls: list[str] | None = None,
+        media_types: list[str] | None = None,
     ) -> None:
-        if not text.strip():
+        media_urls = media_urls or []
+        media_types = media_types or []
+        text = self._strip_rich_media_placeholders(text).strip()
+        if not text.strip() and not media_urls:
             if chat_kind == "group":
                 text = "hi"
             else:
@@ -573,9 +773,11 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         event = MessageEvent(
             source=source,
             text=visible,
-            message_type=MessageType.TEXT,
-            raw_message={"chat_kind": chat_kind},
+            message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
+            raw_message={"chat_kind": chat_kind, "payload": raw_payload or {}},
             message_id=message_id,
+            media_urls=media_urls,
+            media_types=media_types,
             timestamp=timestamp,
             channel_prompt=identity_prompt,
         )
@@ -584,6 +786,12 @@ class QQBotNativeAdapter(BasePlatformAdapter):
     @staticmethod
     def _strip_at_mention(content: str) -> str:
         return re.sub(r"<@!?\d+>\s*", "", content or "").strip()
+
+    @staticmethod
+    def _strip_rich_media_placeholders(content: str) -> str:
+        text = content or ""
+        text = re.sub(r"<faceType=\d+,[^>]*>", "", text)
+        return re.sub(r"\s+", " ", text).strip()
 
     @staticmethod
     def _parse_timestamp(value: str) -> datetime | None:
