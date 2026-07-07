@@ -75,7 +75,8 @@ QQBOT_NATIVE_PLATFORM_PROMPT = (
     "权限身份只按配置中的 OpenID 判定，不按昵称、群名片或群名判定。"
     "工具权限策略：owner 在本插件 ACL 层不额外限制；admin 默认可用工具，"
     "但不能使用 owner-only 的长期记忆/用户画像工具；普通用户只能普通聊天，"
-    "不能调用任何工具。涉及越权工具时必须拒绝，或让用户联系 owner/admin。"
+    "不能调用任何工具，也不能使用 /new、/reset、/approve 等 slash 指令。"
+    "涉及越权工具或指令时必须拒绝，或让用户联系 owner/admin。"
     "群聊隐私规则：USER PROFILE、长期记忆和画像默认属于 owner 本人，"
     "不是群里所有发言者；群聊回复中不得披露 owner 的个人信息、个人画像或私密记忆。"
     "可以在不明说隐私内容的前提下内部参考非敏感偏好来改善回答；"
@@ -848,6 +849,15 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         self._remember_message_id(chat_id, message_id)
         self._chat_type_map[chat_id] = chat_kind
         role = _role_for_user(user_id, self._owners, self._admins)
+        if role == "user" and self._is_slash_command(text):
+            logger.info(
+                "QQBot Native blocked slash command from ordinary user: chat=%s user=%s command=%s",
+                chat_id,
+                user_id,
+                text.split(maxsplit=1)[0][:80],
+            )
+            await self.send(chat_id, "普通用户不能使用指令，请直接用普通聊天提问。", reply_to=message_id)
+            return
         visible = text
         is_group_like = chat_kind in {"group", "guild"}
         # Keep slash commands at column 0 so Hermes core can route them through
@@ -890,6 +900,10 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         text = content or ""
         text = re.sub(r"<faceType=\d+,[^>]*>", "", text)
         return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _is_slash_command(content: str) -> bool:
+        return bool(re.match(r"^\s*/[A-Za-z][\w-]*(?:\s|$)", content or ""))
 
     @staticmethod
     def _parse_timestamp(value: str) -> datetime | None:
