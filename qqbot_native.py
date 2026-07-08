@@ -8,6 +8,7 @@ native Markdown QQBot access:
 - QQBot gateway WebSocket identify/heartbeat
 - inbound C2C, group @, guild/channel, and guild-DM message events
 - outbound C2C/group Markdown messages, guild text messages
+- outbound C2C/group official RichMedia document messages for URLs/small local files
 - owner/admin/user ACL + pre-tool-call guard
 
 Advanced official QQBot features (media upload, buttons, channel reactions) can
@@ -43,8 +44,12 @@ TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 GATEWAY_URL_PATH = "/gateway"
 MSG_TYPE_TEXT = 0
 MSG_TYPE_MARKDOWN = 2
+MSG_TYPE_MEDIA = 7
+MEDIA_TYPE_FILE = 4
 MAX_MESSAGE_LENGTH = 4000
+MAX_INLINE_FILE_BYTES = 9_500_000
 DEFAULT_API_TIMEOUT = aiohttp.ClientTimeout(total=30)
+FILE_UPLOAD_TIMEOUT = 120.0
 LAST_MESSAGE_STATE_PATH = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser() / "qqbot_native_last_messages.json"
 PASSIVE_REPLY_WINDOW_SECONDS = 5 * 60
 IMAGE_URL_KEYS = {
@@ -998,6 +1003,133 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         if reply_to:
             body["msg_id"] = reply_to
         return body
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Send a document through official QQBot RichMedia."""
+        del metadata, kwargs
+        try:
+            kind, bare_chat_id = self._resolve_outbound_kind(chat_id)
+            if kind == "guild":
+                return SendResult(
+                    success=False,
+                    error="QQBot Native document send is not supported for QQ guild/channel chats.",
+                    retryable=False,
+                )
+            if kind == "dm":
+                return SendResult(
+                    success=False,
+                    error="QQBot Native guild DM document sending is not implemented; use C2C or group chats.",
+                    retryable=False,
+                )
+
+            effective_reply_to = reply_to or self._recent_reply_anchor(bare_chat_id)
+            upload = await self._upload_document(kind, bare_chat_id, file_path, file_name=file_name)
+            file_info = upload.get("file_info") or (upload.get("data") or {}).get("file_info")
+            if not file_info:
+                return SendResult(success=False, error=f"QQBot Native file upload returned no file_info: {upload}")
+
+            body: dict[str, Any] = {
+                "msg_type": MSG_TYPE_MEDIA,
+                "media": {"file_info": file_info},
+                "msg_seq": self._next_msg_seq(effective_reply_to or bare_chat_id),
+            }
+            if caption:
+                body["content"] = caption[: self.MAX_MESSAGE_LENGTH]
+            if effective_reply_to:
+                body["msg_id"] = effective_reply_to
+
+            path = f"/v2/groups/{bare_chat_id}/messages" if kind == "group" else f"/v2/users/{bare_chat_id}/messages"
+            data = await self._api_request("POST", path, body)
+            return SendResult(success=True, message_id=str(data.get("id") or uuid.uuid4().hex[:12]), raw_response=data)
+        except Exception as exc:
+            logger.error("QQBot Native document send failed: %s", exc)
+            return SendResult(success=False, error=str(exc), retryable=False)
+
+    def _resolve_outbound_kind(self, chat_id: str) -> tuple[str, str]:
+        kind = self._chat_type_map.get(chat_id)
+        if not kind:
+            if chat_id.startswith("group:") or chat_id in self._group_allow_chats:
+                kind = "group"
+            else:
+                kind = "c2c"
+        return kind, str(chat_id).removeprefix("group:")
+
+    async def _upload_document(self, kind: str, chat_id: str, source: str, *, file_name: Optional[str] = None) -> dict[str, Any]:
+        if kind not in {"c2c", "group"}:
+            raise ValueError(f"QQBot Native document upload does not support chat kind {kind!r}")
+        src = str(source or "").strip()
+        if not src:
+            raise ValueError("file_path is required")
+        body: dict[str, Any] = {
+            "file_type": MEDIA_TYPE_FILE,
+            "srv_send_msg": False,
+        }
+        if self._is_url(src):
+            body["url"] = src
+            resolved_name = file_name or Path(src.split("?", 1)[0]).name or "file"
+        else:
+            local_path = Path(src).expanduser()
+            if not local_path.is_absolute():
+                local_path = (Path.cwd() / local_path).resolve()
+            if not local_path.exists() or not local_path.is_file():
+                raise FileNotFoundError(f"file not found: {local_path}")
+            size = local_path.stat().st_size
+            resolved_name = file_name or local_path.name
+            if size > MAX_INLINE_FILE_BYTES:
+                return await self._upload_document_chunked(kind, chat_id, local_path, resolved_name)
+            body["file_data"] = base64.b64encode(local_path.read_bytes()).decode("ascii")
+        body["file_name"] = resolved_name or "file"
+        path = f"/v2/groups/{chat_id}/files" if kind == "group" else f"/v2/users/{chat_id}/files"
+        return await self._api_request("POST", path, body)
+
+    async def _upload_document_chunked(self, kind: str, chat_id: str, local_path: Path, file_name: str) -> dict[str, Any]:
+        try:
+            module = __import__("gateway.platforms.qqbot.chunked_upload", fromlist=["ChunkedUploader"])
+            ChunkedUploader = getattr(module, "ChunkedUploader")
+        except Exception as exc:
+            raise RuntimeError("Hermes QQBot chunked uploader is unavailable; cannot upload large local files") from exc
+
+        uploader = ChunkedUploader(
+            api_request=self._chunked_upload_api_request,
+            http_put=self._chunked_upload_put,
+            log_tag="QQBot Native",
+        )
+        return await uploader.upload(
+            chat_type=kind,
+            target_id=chat_id,
+            file_path=str(local_path),
+            file_type=MEDIA_TYPE_FILE,
+            file_name=file_name,
+        )
+
+    async def _chunked_upload_api_request(self, method: str, path: str, body: Optional[dict] = None, timeout: float = FILE_UPLOAD_TIMEOUT) -> dict[str, Any]:
+        del timeout
+        return await self._api_request(method, path, body)
+
+    async def _chunked_upload_put(self, url: str, data: bytes, headers: Optional[dict] = None, timeout: float = FILE_UPLOAD_TIMEOUT) -> Any:
+        if not self._session:
+            self._session = aiohttp.ClientSession(trust_env=True)
+        async with self._session.put(
+            url,
+            data=data,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            text = await resp.text()
+            return type("QQBotNativePutResponse", (), {"status_code": resp.status, "text": text})()
+
+    @staticmethod
+    def _is_url(source: str) -> bool:
+        return str(source or "").lower().startswith(("http://", "https://"))
 
     @staticmethod
     def _next_msg_seq(seed: str) -> int:
