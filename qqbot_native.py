@@ -693,7 +693,13 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             filename = str(att.get("filename") or att.get("file_name") or att.get("name") or "")
             url = self._attachment_url(att)
             if self._is_voice_content_type(ct, filename):
-                transcript = self._voice_transcript_from_attachment(att)
+                transcript = await self._stt_voice_attachment(
+                    url,
+                    ct,
+                    filename,
+                    asr_refer_text=self._voice_transcript_from_attachment(att) or None,
+                    voice_wav_url=str(att.get("voice_wav_url") or att.get("voiceWavUrl") or "").strip() or None,
+                )
                 if transcript:
                     voice_transcripts.append(f"[Voice] {transcript}")
                 elif url:
@@ -734,6 +740,160 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return ""
+
+    def _qq_media_headers(self) -> dict[str, str]:
+        token = getattr(self, "_access_token", "")
+        return {"Authorization": f"QQBot {token}"} if token else {}
+
+    async def _stt_voice_attachment(
+        self,
+        url: str,
+        content_type: str,
+        filename: str,
+        *,
+        asr_refer_text: Optional[str] = None,
+        voice_wav_url: Optional[str] = None,
+    ) -> Optional[str]:
+        if asr_refer_text:
+            return asr_refer_text
+        download_url = (voice_wav_url or url or "").strip()
+        if download_url.startswith("//"):
+            download_url = f"https:{download_url}"
+        if not download_url:
+            return None
+        try:
+            url_safety = __import__("tools.url_safety", fromlist=["is_safe_url"])
+            if not url_safety.is_safe_url(download_url):
+                logger.warning("QQBot Native STT blocked unsafe URL: %s", download_url[:80])
+                return None
+        except Exception:
+            pass
+        if not self._session:
+            self._session = aiohttp.ClientSession(trust_env=True)
+        try:
+            headers = self._qq_media_headers()
+            async with self._session.get(download_url, headers=headers, timeout=DEFAULT_API_TIMEOUT) as resp:
+                data = await resp.read()
+                if resp.status >= 400:
+                    raise RuntimeError(f"HTTP {resp.status}: {data[:160]!r}")
+            if len(data) < 10:
+                return None
+            if voice_wav_url:
+                wav_path = await self._write_temp_audio(data, ".wav")
+            else:
+                wav_path = await self._convert_audio_to_wav_file(data, filename or content_type)
+            if not wav_path:
+                return None
+            try:
+                return await self._call_stt(wav_path)
+            finally:
+                with suppress(OSError):
+                    os.unlink(wav_path)
+        except Exception as exc:
+            logger.warning("QQBot Native STT failed for voice attachment: %s", exc)
+            return None
+
+    @staticmethod
+    async def _write_temp_audio(data: bytes, suffix: str) -> str:
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=suffix or ".wav", delete=False) as tmp:
+            tmp.write(data)
+            return tmp.name
+
+    async def _convert_audio_to_wav_file(self, audio_data: bytes, filename: str) -> Optional[str]:
+        ext = Path(filename or "").suffix.lower() or self._guess_ext_from_data(audio_data)
+        src_path = await self._write_temp_audio(audio_data, ext)
+        wav_path = src_path.rsplit(".", 1)[0] + ".wav"
+        try:
+            result = await self._convert_silk_to_wav(src_path, wav_path)
+            if not result:
+                result = await self._convert_ffmpeg_to_wav(src_path, wav_path)
+            if not result:
+                result = await self._convert_raw_to_wav(audio_data, wav_path)
+            return result
+        finally:
+            with suppress(OSError):
+                os.unlink(src_path)
+
+    @staticmethod
+    def _guess_ext_from_data(data: bytes) -> str:
+        if data[:9] == b"#!SILK_V3" or data[:6] == b"#!SILK" or data[:2] == b"\x02!":
+            return ".silk"
+        if data[:4] == b"RIFF":
+            return ".wav"
+        if data[:4] == b"fLaC":
+            return ".flac"
+        if data[:2] in {b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"}:
+            return ".mp3"
+        if data[:4] == b"OggS":
+            return ".ogg"
+        return ".amr"
+
+    async def _convert_silk_to_wav(self, src_path: str, wav_path: str) -> Optional[str]:
+        try:
+            pilk = __import__("pilk")
+        except Exception:
+            return None
+        for candidate in (src_path, src_path.rsplit(".", 1)[0] + ".silk"):
+            copied = False
+            try:
+                if candidate != src_path:
+                    import shutil
+                    shutil.copy2(src_path, candidate)
+                    copied = True
+                pilk.silk_to_wav(candidate, wav_path, rate=16000)
+                if Path(wav_path).exists() and Path(wav_path).stat().st_size > 44:
+                    return wav_path
+            except Exception as exc:
+                logger.debug("QQBot Native pilk conversion failed: %s", exc)
+            finally:
+                if copied:
+                    with suppress(OSError):
+                        os.unlink(candidate)
+        return None
+
+    async def _convert_ffmpeg_to_wav(self, src_path: str, wav_path: str) -> Optional[str]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", src_path, "-ar", "16000", "-ac", "1", wav_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=30)
+            if proc.returncode != 0:
+                stderr = await proc.stderr.read() if proc.stderr else b""
+                logger.debug("QQBot Native ffmpeg conversion failed: %s", stderr[:200].decode(errors="replace"))
+                return None
+        except Exception as exc:
+            logger.debug("QQBot Native ffmpeg conversion error: %s", exc)
+            return None
+        if Path(wav_path).exists() and Path(wav_path).stat().st_size > 44:
+            return wav_path
+        return None
+
+    async def _convert_raw_to_wav(self, audio_data: bytes, wav_path: str) -> Optional[str]:
+        try:
+            import wave
+            with wave.open(wav_path, "w") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(audio_data)
+            return wav_path if Path(wav_path).exists() and Path(wav_path).stat().st_size > 44 else None
+        except Exception:
+            return None
+
+    async def _call_stt(self, wav_path: str) -> Optional[str]:
+        try:
+            voice_mode = __import__("tools.voice_mode", fromlist=["transcribe_recording"])
+            result = await asyncio.to_thread(voice_mode.transcribe_recording, wav_path)
+            if isinstance(result, dict) and result.get("success"):
+                text = str(result.get("transcript") or "").strip()
+                return text or None
+            logger.debug("QQBot Native STT returned no transcript: %s", result)
+        except Exception as exc:
+            logger.debug("QQBot Native STT unavailable/failed: %s", exc)
+        return None
 
     async def _process_event_media(self, payload: dict[str, Any], content: str) -> tuple[list[str], list[str], str]:
         """Return `(media_urls, media_types, attachment_info)` for a QQBot event."""
