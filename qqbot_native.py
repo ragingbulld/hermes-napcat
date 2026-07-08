@@ -8,11 +8,12 @@ native Markdown QQBot access:
 - QQBot gateway WebSocket identify/heartbeat
 - inbound C2C, group @, guild/channel, and guild-DM message events
 - outbound C2C/group Markdown messages, guild text messages
-- outbound C2C/group official RichMedia document messages for URLs/small local files
+- outbound C2C/group official RichMedia media/document messages for URLs/local files
+- quoted-message context, C2C typing indicator, and QQ inline approval/update buttons
 - owner/admin/user ACL + pre-tool-call guard
 
-Advanced official QQBot features (media upload, buttons, channel reactions) can
-be layered on later without changing Hermes core.
+Keep this adapter plugin-local: do not patch Hermes core for deployment-specific
+QQ behavior.
 """
 from __future__ import annotations
 
@@ -44,12 +45,18 @@ TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 GATEWAY_URL_PATH = "/gateway"
 MSG_TYPE_TEXT = 0
 MSG_TYPE_MARKDOWN = 2
+MSG_TYPE_INPUT_NOTIFY = 6
 MSG_TYPE_MEDIA = 7
+MEDIA_TYPE_IMAGE = 1
+MEDIA_TYPE_VIDEO = 2
+MEDIA_TYPE_VOICE = 3
 MEDIA_TYPE_FILE = 4
 MAX_MESSAGE_LENGTH = 4000
 MAX_INLINE_FILE_BYTES = 9_500_000
 DEFAULT_API_TIMEOUT = aiohttp.ClientTimeout(total=30)
 FILE_UPLOAD_TIMEOUT = 120.0
+TYPING_INPUT_SECONDS = 60
+TYPING_DEBOUNCE_SECONDS = 50
 LAST_MESSAGE_STATE_PATH = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser() / "qqbot_native_last_messages.json"
 PASSIVE_REPLY_WINDOW_SECONDS = 5 * 60
 IMAGE_URL_KEYS = {
@@ -274,6 +281,8 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         self._load_last_message_state()
         self._chat_type_map: dict[str, str] = {}
         self._seen_messages: dict[str, float] = {}
+        self._typing_sent_at: dict[str, float] = {}
+        self._interaction_callback = self._default_interaction_dispatch
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -458,6 +467,9 @@ class QQBotNativeAdapter(BasePlatformAdapter):
                 return
             if t in {"C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GUILD_MESSAGE_CREATE", "GUILD_AT_MESSAGE_CREATE", "DIRECT_MESSAGE_CREATE"}:
                 asyncio.create_task(self._on_message(str(t), d))
+                return
+            if t == "INTERACTION_CREATE":
+                asyncio.create_task(self._on_interaction(d))
                 return
         if op == 7 and self._ws and not self._ws.closed:
             asyncio.create_task(self._ws.close())
@@ -661,10 +673,11 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         placeholders embedded in `content` are handled by `_process_event_media`.
         """
         if not isinstance(attachments, list):
-            return {"image_urls": [], "image_media_types": [], "attachment_info": ""}
+            return {"image_urls": [], "image_media_types": [], "voice_transcripts": [], "attachment_info": ""}
 
         image_urls: list[str] = []
         image_media_types: list[str] = []
+        voice_transcripts: list[str] = []
         other_attachments: list[str] = []
 
         for att in attachments:
@@ -679,6 +692,13 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             ).strip().lower()
             filename = str(att.get("filename") or att.get("file_name") or att.get("name") or "")
             url = self._attachment_url(att)
+            if self._is_voice_content_type(ct, filename):
+                transcript = self._voice_transcript_from_attachment(att)
+                if transcript:
+                    voice_transcripts.append(f"[Voice] {transcript}")
+                elif url:
+                    voice_transcripts.append(f"[Voice attachment: {filename or ct or 'voice'}]")
+                continue
             if not url:
                 continue
             if ct.startswith("image/") or filename.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")) or _looks_like_image_url(url):
@@ -692,15 +712,38 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         return {
             "image_urls": image_urls,
             "image_media_types": image_media_types,
+            "voice_transcripts": voice_transcripts,
             "attachment_info": "\n".join(other_attachments),
         }
+
+    @staticmethod
+    def _is_voice_content_type(content_type: str, filename: str = "") -> bool:
+        ct = (content_type or "").lower()
+        name = (filename or "").lower()
+        return (
+            ct.startswith("audio/")
+            or "voice" in ct
+            or "silk" in ct
+            or name.endswith((".silk", ".amr", ".m4a", ".mp3", ".wav", ".ogg", ".opus"))
+        )
+
+    @staticmethod
+    def _voice_transcript_from_attachment(att: dict[str, Any]) -> str:
+        for key in ("asr_refer_text", "asrReferText", "voice_text", "voiceText", "text", "transcript"):
+            value = att.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
 
     async def _process_event_media(self, payload: dict[str, Any], content: str) -> tuple[list[str], list[str], str]:
         """Return `(media_urls, media_types, attachment_info)` for a QQBot event."""
         att_result = await self._process_attachments(payload.get("attachments"))
         media_urls = list(att_result["image_urls"])
         media_types = list(att_result["image_media_types"])
+        info_parts = [str(x) for x in att_result.get("voice_transcripts", []) if str(x).strip()]
         attachment_info = str(att_result.get("attachment_info") or "")
+        if attachment_info.strip():
+            info_parts.append(attachment_info.strip())
 
         fallback_payload = {k: v for k, v in payload.items() if k != "attachments"}
         fallback_candidates = self._extract_image_candidates(fallback_payload, content)
@@ -711,7 +754,14 @@ class QQBotNativeAdapter(BasePlatformAdapter):
                 seen.add(path)
                 media_urls.append(path)
                 media_types.append(mime)
-        return media_urls, media_types, attachment_info
+
+        quoted = await self._process_quoted_context(payload)
+        if quoted["quote_block"]:
+            info_parts.insert(0, quoted["quote_block"])
+        if quoted["image_urls"]:
+            media_urls.extend(quoted["image_urls"])
+            media_types.extend(quoted["image_media_types"])
+        return media_urls, media_types, "\n\n".join(info_parts)
 
     @staticmethod
     def _append_attachment_info(text: str, attachment_info: str) -> str:
@@ -719,6 +769,48 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         if not info:
             return text
         return f"{text}\n\n{info}".strip() if text.strip() else info
+
+    async def _process_quoted_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        empty = {"quote_block": "", "image_urls": [], "image_media_types": []}
+        try:
+            if int(payload.get("message_type", 0) or 0) != 103:
+                return empty
+        except (TypeError, ValueError):
+            return empty
+        elements = payload.get("msg_elements")
+        if not isinstance(elements, list) or not elements:
+            return empty
+
+        quoted_text_parts: list[str] = []
+        all_attachments: list[dict[str, Any]] = []
+        for elem in elements:
+            if not isinstance(elem, dict):
+                continue
+            text = str(elem.get("content") or "").strip()
+            if text:
+                quoted_text_parts.append(text)
+            attachments = elem.get("attachments")
+            if isinstance(attachments, list):
+                all_attachments.extend([a for a in attachments if isinstance(a, dict)])
+
+        att_result = await self._process_attachments(all_attachments)
+        quoted_images = list(att_result.get("image_urls") or [])
+        quoted_image_types = list(att_result.get("image_media_types") or [])
+        lines = quoted_text_parts[:]
+        lines.extend(str(x) for x in att_result.get("voice_transcripts", []) if str(x).strip())
+        attachment_info = str(att_result.get("attachment_info") or "").strip()
+        if attachment_info:
+            lines.append(attachment_info)
+        if not lines and not quoted_images:
+            return empty
+        quote_block = "[Quoted message]:\n" + "\n".join(lines) if lines else "[Quoted message]: (image)"
+        return {"quote_block": quote_block, "image_urls": quoted_images, "image_media_types": quoted_image_types}
+
+    @staticmethod
+    def _merge_quote_into(text: str, quote_block: str) -> str:
+        if not quote_block:
+            return text
+        return f"{quote_block}\n\n{text}".strip() if text.strip() else quote_block
 
     async def _on_message(self, event_type: str, d: Any) -> None:
         if not isinstance(d, dict):
@@ -910,6 +1002,167 @@ class QQBotNativeAdapter(BasePlatformAdapter):
     def _is_slash_command(content: str) -> bool:
         return bool(re.match(r"^\s*/[A-Za-z][\w-]*(?:\s|$)", content or ""))
 
+    def set_interaction_callback(self, callback: Any) -> None:
+        self._interaction_callback = callback
+
+    async def _on_interaction(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            keyboards = __import__("gateway.platforms.qqbot.keyboards", fromlist=["parse_interaction_event"])
+            event = keyboards.parse_interaction_event(payload)
+        except Exception as exc:
+            logger.warning("QQBot Native failed to parse INTERACTION_CREATE: %s", exc)
+            return
+        if not getattr(event, "id", ""):
+            logger.warning("QQBot Native INTERACTION_CREATE missing id")
+            return
+        try:
+            await self._acknowledge_interaction(str(event.id))
+        except Exception as exc:
+            logger.warning("QQBot Native failed to ACK interaction %s: %s", event.id, exc)
+        callback = self._interaction_callback
+        if callback is None:
+            return
+        try:
+            await callback(event)
+        except Exception as exc:
+            logger.error("QQBot Native interaction callback raised: %s", exc, exc_info=True)
+
+    async def _acknowledge_interaction(self, interaction_id: str, code: int = 0) -> None:
+        await self._api_request("PUT", f"/interactions/{interaction_id}", {"code": code})
+
+    _APPROVAL_BUTTON_TO_CHOICE = {
+        "allow-once": "once",
+        "allow-always": "always",
+        "deny": "deny",
+    }
+    _APPROVAL_TIMEOUT_SECONDS = 300
+
+    @staticmethod
+    def _parse_gateway_session_key(session_key: str) -> dict[str, str] | None:
+        parts = str(session_key or "").split(":")
+        if len(parts) < 5 or parts[0] != "agent" or parts[1] != "main":
+            return None
+        parsed = {"platform": parts[2], "chat_type": parts[3], "chat_id": parts[4]}
+        if len(parts) > 5:
+            parsed["user_id"] = parts[5]
+        return parsed
+
+    def _is_authorized_interaction_for_session(self, event: Any, session_key: str) -> bool:
+        parsed = self._parse_gateway_session_key(session_key)
+        operator = str(getattr(event, "operator_openid", "") or "").strip()
+        if not parsed or parsed.get("platform") not in {PLATFORM_NAME, "qqbot"} or not operator:
+            return False
+        chat_type = parsed.get("chat_type", "")
+        chat_id = parsed.get("chat_id", "")
+        if chat_type in {"c2c", "dm"}:
+            return bool(chat_id) and operator == chat_id
+        if chat_type in {"group", "guild"}:
+            event_chat = str(getattr(event, "group_openid", "") or getattr(event, "guild_id", "") or "").strip()
+            if not event_chat or event_chat != chat_id:
+                return False
+            session_user = str(parsed.get("user_id", "")).strip()
+            return bool(session_user) and operator == session_user
+        return False
+
+    async def _default_interaction_dispatch(self, event: Any) -> None:
+        button_data = str(getattr(event, "button_data", "") or "")
+        if not button_data:
+            return
+        try:
+            keyboards = __import__("gateway.platforms.qqbot.keyboards", fromlist=["parse_approval_button_data", "parse_update_prompt_button_data"])
+            approval = keyboards.parse_approval_button_data(button_data)
+            if approval is not None:
+                session_key, decision = approval
+                choice = self._APPROVAL_BUTTON_TO_CHOICE.get(decision)
+                if not choice:
+                    return
+                if not self._is_authorized_interaction_for_session(event, session_key):
+                    logger.warning("QQBot Native rejected unauthorized approval click for session=%s operator=%s", session_key, getattr(event, "operator_openid", ""))
+                    return
+                from tools.approval import resolve_gateway_approval
+                count = resolve_gateway_approval(session_key, choice)
+                logger.info("QQBot Native button resolved %d approval(s) for session=%s choice=%s", count, session_key, choice)
+                return
+            update_answer = keyboards.parse_update_prompt_button_data(button_data)
+            if update_answer is not None:
+                operator = str(getattr(event, "operator_openid", "") or "").strip()
+                role = _role_for_user(operator, self._owners, self._admins)
+                if role not in {"owner", "admin"}:
+                    logger.warning("QQBot Native rejected unauthorized update-prompt click operator=%s", operator)
+                    return
+                self._write_update_response(update_answer, operator)
+        except Exception as exc:
+            logger.error("QQBot Native interaction dispatch failed: %s", exc, exc_info=True)
+
+    @staticmethod
+    def _write_update_response(answer: str, operator: str = "") -> None:
+        try:
+            from hermes_constants import get_hermes_home
+            response_path = get_hermes_home() / ".update_response"
+            tmp = response_path.with_suffix(".tmp")
+            tmp.write_text(answer)
+            tmp.replace(response_path)
+            logger.info("QQBot Native update prompt answered %r by %s", answer, operator or "(unknown)")
+        except Exception as exc:
+            logger.error("QQBot Native failed to write update response: %s", exc)
+
+    async def send_with_keyboard(self, chat_id: str, content: str, keyboard: Any, reply_to: Optional[str] = None) -> SendResult:
+        kind, bare_chat_id = self._resolve_outbound_kind(chat_id)
+        if kind not in {"c2c", "group"}:
+            return SendResult(success=False, error=f"Inline keyboards not supported for chat kind {kind!r}", retryable=False)
+        effective_reply_to = reply_to or self._recent_reply_anchor(bare_chat_id)
+        body = self._build_text_body(self.format_message(content), effective_reply_to, markdown=self._markdown_support)
+        body["keyboard"] = keyboard.to_dict() if hasattr(keyboard, "to_dict") else keyboard
+        path = f"/v2/groups/{bare_chat_id}/messages" if kind == "group" else f"/v2/users/{bare_chat_id}/messages"
+        try:
+            data = await self._api_request("POST", path, body)
+            return SendResult(success=True, message_id=str(data.get("id") or uuid.uuid4().hex[:12]), raw_response=data)
+        except Exception as exc:
+            logger.error("QQBot Native send_with_keyboard failed: %s", exc)
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def send_approval_request(self, chat_id: str, req: Any, reply_to: Optional[str] = None) -> SendResult:
+        keyboards = __import__("gateway.platforms.qqbot.keyboards", fromlist=["build_approval_text", "build_approval_keyboard"])
+        return await self.send_with_keyboard(chat_id, keyboards.build_approval_text(req), keyboards.build_approval_keyboard(req.session_key), reply_to=reply_to)
+
+    async def send_exec_approval(self, chat_id: str, command: str, session_key: str, description: str = "dangerous command", metadata: Optional[dict] = None) -> SendResult:
+        del metadata
+        keyboards = __import__("gateway.platforms.qqbot.keyboards", fromlist=["ApprovalRequest"])
+        req = keyboards.ApprovalRequest(session_key=session_key, title="Execute this command?", description=description, command_preview=command, timeout_sec=self._APPROVAL_TIMEOUT_SECONDS)
+        return await self.send_approval_request(chat_id, req, reply_to=self._recent_reply_anchor(str(chat_id).removeprefix("group:")))
+
+    async def send_update_prompt(self, chat_id: str, prompt: str, default: str = "", session_key: str = "", metadata: Optional[dict] = None) -> SendResult:
+        del session_key, metadata
+        keyboards = __import__("gateway.platforms.qqbot.keyboards", fromlist=["build_update_prompt_keyboard"])
+        default_hint = f" (default: {default})" if default else ""
+        content = f"⚕ **Update Needs Your Input**\n\n{prompt}{default_hint}"
+        return await self.send_with_keyboard(chat_id, content, keyboards.build_update_prompt_keyboard(), reply_to=self._recent_reply_anchor(str(chat_id).removeprefix("group:")))
+
+    async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
+        del metadata
+        kind, bare_chat_id = self._resolve_outbound_kind(chat_id)
+        if kind != "c2c":
+            return
+        msg_id = self._recent_reply_anchor(bare_chat_id)
+        if not msg_id:
+            return
+        now = time.time()
+        if now - self._typing_sent_at.get(bare_chat_id, 0.0) < TYPING_DEBOUNCE_SECONDS:
+            return
+        body = {
+            "msg_type": MSG_TYPE_INPUT_NOTIFY,
+            "msg_id": msg_id,
+            "input_notify": {"input_type": 1, "input_second": TYPING_INPUT_SECONDS},
+            "msg_seq": self._next_msg_seq(bare_chat_id),
+        }
+        try:
+            await self._api_request("POST", f"/v2/users/{bare_chat_id}/messages", body)
+            self._typing_sent_at[bare_chat_id] = now
+        except Exception as exc:
+            logger.debug("QQBot Native send_typing failed: %s", exc)
+
     @staticmethod
     def _parse_timestamp(value: str) -> datetime | None:
         if not value:
@@ -1004,6 +1257,54 @@ class QQBotNativeAdapter(BasePlatformAdapter):
             body["msg_id"] = reply_to
         return body
 
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> SendResult:
+        del metadata
+        result = await self._send_media(chat_id, image_url, MEDIA_TYPE_IMAGE, "image", caption, reply_to)
+        if result.success or not self._is_url(image_url):
+            return result
+        fallback = f"{caption}\n{image_url}" if caption else image_url
+        return await self.send(chat_id, fallback, reply_to=reply_to)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media(chat_id, image_path, MEDIA_TYPE_IMAGE, "image", caption, reply_to)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media(chat_id, audio_path, MEDIA_TYPE_VOICE, "voice", caption, reply_to)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media(chat_id, video_path, MEDIA_TYPE_VIDEO, "video", caption, reply_to)
+
     async def send_document(
         self,
         chat_id: str,
@@ -1014,29 +1315,30 @@ class QQBotNativeAdapter(BasePlatformAdapter):
         metadata: Optional[dict] = None,
         **kwargs: Any,
     ) -> SendResult:
-        """Send a document through official QQBot RichMedia."""
         del metadata, kwargs
+        return await self._send_media(chat_id, file_path, MEDIA_TYPE_FILE, "file", caption, reply_to, file_name=file_name)
+
+    async def _send_media(
+        self,
+        chat_id: str,
+        media_source: str,
+        file_type: int,
+        kind_name: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> SendResult:
         try:
             kind, bare_chat_id = self._resolve_outbound_kind(chat_id)
             if kind == "guild":
-                return SendResult(
-                    success=False,
-                    error="QQBot Native document send is not supported for QQ guild/channel chats.",
-                    retryable=False,
-                )
+                return SendResult(success=False, error=f"QQBot Native {kind_name} media send is not supported for QQ guild/channel chats.", retryable=False)
             if kind == "dm":
-                return SendResult(
-                    success=False,
-                    error="QQBot Native guild DM document sending is not implemented; use C2C or group chats.",
-                    retryable=False,
-                )
-
+                return SendResult(success=False, error=f"QQBot Native guild DM {kind_name} media sending is not implemented; use C2C or group chats.", retryable=False)
             effective_reply_to = reply_to or self._recent_reply_anchor(bare_chat_id)
-            upload = await self._upload_document(kind, bare_chat_id, file_path, file_name=file_name)
+            upload = await self._upload_media(kind, bare_chat_id, media_source, file_type=file_type, file_name=file_name)
             file_info = upload.get("file_info") or (upload.get("data") or {}).get("file_info")
             if not file_info:
-                return SendResult(success=False, error=f"QQBot Native file upload returned no file_info: {upload}")
-
+                return SendResult(success=False, error=f"QQBot Native {kind_name} upload returned no file_info: {upload}")
             body: dict[str, Any] = {
                 "msg_type": MSG_TYPE_MEDIA,
                 "media": {"file_info": file_info},
@@ -1046,12 +1348,11 @@ class QQBotNativeAdapter(BasePlatformAdapter):
                 body["content"] = caption[: self.MAX_MESSAGE_LENGTH]
             if effective_reply_to:
                 body["msg_id"] = effective_reply_to
-
             path = f"/v2/groups/{bare_chat_id}/messages" if kind == "group" else f"/v2/users/{bare_chat_id}/messages"
             data = await self._api_request("POST", path, body)
             return SendResult(success=True, message_id=str(data.get("id") or uuid.uuid4().hex[:12]), raw_response=data)
         except Exception as exc:
-            logger.error("QQBot Native document send failed: %s", exc)
+            logger.error("QQBot Native %s media send failed: %s", kind_name, exc)
             return SendResult(success=False, error=str(exc), retryable=False)
 
     def _resolve_outbound_kind(self, chat_id: str) -> tuple[str, str]:
@@ -1063,53 +1364,42 @@ class QQBotNativeAdapter(BasePlatformAdapter):
                 kind = "c2c"
         return kind, str(chat_id).removeprefix("group:")
 
-    async def _upload_document(self, kind: str, chat_id: str, source: str, *, file_name: Optional[str] = None) -> dict[str, Any]:
+    async def _upload_media(self, kind: str, chat_id: str, source: str, *, file_type: int, file_name: Optional[str] = None) -> dict[str, Any]:
         if kind not in {"c2c", "group"}:
-            raise ValueError(f"QQBot Native document upload does not support chat kind {kind!r}")
+            raise ValueError(f"QQBot Native media upload does not support chat kind {kind!r}")
         src = str(source or "").strip()
         if not src:
-            raise ValueError("file_path is required")
-        body: dict[str, Any] = {
-            "file_type": MEDIA_TYPE_FILE,
-            "srv_send_msg": False,
-        }
+            raise ValueError("media source is required")
+        body: dict[str, Any] = {"file_type": file_type, "srv_send_msg": False}
         if self._is_url(src):
             body["url"] = src
-            resolved_name = file_name or Path(src.split("?", 1)[0]).name or "file"
+            if file_type == MEDIA_TYPE_FILE:
+                body["file_name"] = file_name or Path(src.split("?", 1)[0]).name or "file"
         else:
             local_path = Path(src).expanduser()
             if not local_path.is_absolute():
                 local_path = (Path.cwd() / local_path).resolve()
             if not local_path.exists() or not local_path.is_file():
+                if src.startswith("<") or len(src) < 3:
+                    raise ValueError(f"invalid media source placeholder: {src!r}")
                 raise FileNotFoundError(f"file not found: {local_path}")
-            size = local_path.stat().st_size
             resolved_name = file_name or local_path.name
-            if size > MAX_INLINE_FILE_BYTES:
-                return await self._upload_document_chunked(kind, chat_id, local_path, resolved_name)
+            if local_path.stat().st_size > MAX_INLINE_FILE_BYTES:
+                return await self._upload_media_chunked(kind, chat_id, local_path, file_type, resolved_name)
             body["file_data"] = base64.b64encode(local_path.read_bytes()).decode("ascii")
-        body["file_name"] = resolved_name or "file"
+            if file_type == MEDIA_TYPE_FILE:
+                body["file_name"] = resolved_name
         path = f"/v2/groups/{chat_id}/files" if kind == "group" else f"/v2/users/{chat_id}/files"
         return await self._api_request("POST", path, body)
 
-    async def _upload_document_chunked(self, kind: str, chat_id: str, local_path: Path, file_name: str) -> dict[str, Any]:
+    async def _upload_media_chunked(self, kind: str, chat_id: str, local_path: Path, file_type: int, file_name: str) -> dict[str, Any]:
         try:
             module = __import__("gateway.platforms.qqbot.chunked_upload", fromlist=["ChunkedUploader"])
             ChunkedUploader = getattr(module, "ChunkedUploader")
         except Exception as exc:
-            raise RuntimeError("Hermes QQBot chunked uploader is unavailable; cannot upload large local files") from exc
-
-        uploader = ChunkedUploader(
-            api_request=self._chunked_upload_api_request,
-            http_put=self._chunked_upload_put,
-            log_tag="QQBot Native",
-        )
-        return await uploader.upload(
-            chat_type=kind,
-            target_id=chat_id,
-            file_path=str(local_path),
-            file_type=MEDIA_TYPE_FILE,
-            file_name=file_name,
-        )
+            raise RuntimeError("Hermes QQBot chunked uploader is unavailable; cannot upload large local media") from exc
+        uploader = ChunkedUploader(api_request=self._chunked_upload_api_request, http_put=self._chunked_upload_put, log_tag="QQBot Native")
+        return await uploader.upload(chat_type=kind, target_id=chat_id, file_path=str(local_path), file_type=file_type, file_name=file_name)
 
     async def _chunked_upload_api_request(self, method: str, path: str, body: Optional[dict] = None, timeout: float = FILE_UPLOAD_TIMEOUT) -> dict[str, Any]:
         del timeout
@@ -1118,12 +1408,7 @@ class QQBotNativeAdapter(BasePlatformAdapter):
     async def _chunked_upload_put(self, url: str, data: bytes, headers: Optional[dict] = None, timeout: float = FILE_UPLOAD_TIMEOUT) -> Any:
         if not self._session:
             self._session = aiohttp.ClientSession(trust_env=True)
-        async with self._session.put(
-            url,
-            data=data,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as resp:
+        async with self._session.put(url, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             text = await resp.text()
             return type("QQBotNativePutResponse", (), {"status_code": resp.status, "text": text})()
 
