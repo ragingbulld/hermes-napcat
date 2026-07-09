@@ -15,7 +15,6 @@ Out-of-tree Hermes Agent platform plugin for QQ via [NapCat](https://github.com/
 - Processing and post-response QQ emoji reactions
 - Private-chat typing indicator support
 - Plain-text formatting for NapCat QQ, because ordinary QQ does not render Markdown
-- Optional plugin-local `qqbot_native` platform for official QQBot access with native Markdown output
 
 ## Requirements
 
@@ -93,39 +92,11 @@ NapCat should connect to:
 ws://<hermes-host>:18800
 ```
 
-## Optional official QQBot native platform
-
-The plugin can also register a separate `qqbot_native` platform. This is not
-Hermes' built-in `qqbot` adapter; it lives inside this plugin and keeps official
-QQBot support out of Hermes core. Use it when you want official QQBot native
-Markdown rendering. Official QQBot uses OpenID identities, not normal QQ
-numbers.
-
-```yaml
-platforms:
-  qqbot_native:
-    enabled: false   # flip to true only after app credentials are ready
-    extra:
-      app_id: ""
-      client_secret: ""
-      markdown_support: true
-
-      # OpenIDs, not QQ numbers.
-      owners: []
-      admins: []
-
-      dm_policy: allowlist
-      allow_from: []
-
-      group_policy: allowlist
-      group_allow_chats: []
-```
-
 ## Access control
 
 The plugin has two layers:
 
-1. Reply/session access, configured by your Hermes Gateway/NapCat or QQBot Native platform settings.
+1. Reply/session access, configured by your Hermes Gateway/NapCat platform settings.
 2. Tool-call ACL enforced by this plugin.
 
 Tool roles:
@@ -141,7 +112,6 @@ Do not put real tokens, QQ IDs, group IDs, OpenIDs, or deployment IPs in this re
 ```text
 adapter.py      # Hermes Gateway platform adapter and plugin registration
 napcat_api.py   # Minimal async OneBot 11 HTTP client
-qqbot_native.py # Plugin-local official QQBot adapter with native Markdown
 qq_tool.py      # Hermes qq_* tool registrations
 plugin.yaml     # Hermes plugin metadata
 ```

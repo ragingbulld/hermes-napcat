@@ -14,6 +14,12 @@ import aiohttp
 
 from tools.registry import registry, tool_error, tool_result
 
+from .napcat_api import (
+    call_onebot_api_with_local_file_url_fallback,
+    call_onebot_api_with_media_fallback,
+    normalize_media_reference,
+)
+
 logger = logging.getLogger(__name__)
 
 # ── Runtime config (injected by NapCatAdapter.__init__) ───────────────────────
@@ -69,6 +75,27 @@ def _check() -> str | None:
     if not _http_api:
         return "NapCat HTTP API not configured. Is the NapCat adapter running?"
     return None
+
+
+def _normalize_message_media_segments(message: Any) -> Any:
+    """Convert Hermes-local image/audio/video segment files to base64 refs."""
+    if not isinstance(message, list):
+        return message
+    normalized: list[Any] = []
+    for segment in message:
+        if not isinstance(segment, dict):
+            normalized.append(segment)
+            continue
+        seg = dict(segment)
+        seg_type = str(seg.get("type") or "").lower()
+        data = seg.get("data")
+        if seg_type in {"image", "record", "video"} and isinstance(data, dict):
+            new_data = dict(data)
+            if "file" in new_data:
+                new_data["file"] = normalize_media_reference(str(new_data.get("file") or ""))
+            seg["data"] = new_data
+        normalized.append(seg)
+    return normalized
 
 
 def _require_admin() -> str | None:
@@ -135,14 +162,19 @@ async def _qq_send_message(args: dict, **_) -> str:
     if err:
         return tool_error(err)
     try:
-        data = await _call(
+        resp = await call_onebot_api_with_media_fallback(
+            _http_api,
             "send_msg",
-            message_type=args.get("message_type"),
-            group_id=args.get("group_id"),
-            user_id=args.get("user_id"),
-            message=args["message"],
+            {
+                "message_type": args.get("message_type"),
+                "group_id": args.get("group_id"),
+                "user_id": args.get("user_id"),
+                "message": _normalize_message_media_segments(args["message"]),
+            },
+            access_token=_access_token or None,
+            timeout=30,
         )
-        return tool_result(data)
+        return tool_result(resp.get("data") or {})
     except Exception as e:
         return tool_error(str(e))
 
@@ -1341,20 +1373,38 @@ async def _qq_upload_file(args: dict, **_) -> str:
         return tool_error(err)
     try:
         if args.get("group_id"):
-            data = await _call(
+            resp = await call_onebot_api_with_local_file_url_fallback(
+                _http_api,
                 "upload_group_file",
-                group_id=int(args["group_id"]),
-                file=args["file"],
-                name=args.get("name", ""),
-                folder_id=args.get("folder_id", ""),
+                {
+                    "group_id": int(args["group_id"]),
+                    "file": args["file"],
+                    "name": args.get("name", ""),
+                    "folder_id": args.get("folder_id", ""),
+                },
+                _access_token or None,
             )
         else:
-            data = await _call(
+            resp = await call_onebot_api_with_local_file_url_fallback(
+                _http_api,
                 "upload_private_file",
-                user_id=int(args["user_id"]),
-                file=args["file"],
-                name=args.get("name", ""),
+                {
+                    "user_id": int(args["user_id"]),
+                    "file": args["file"],
+                    "name": args.get("name", ""),
+                },
+                _access_token or None,
             )
+        data = resp.get("data") or {}
+        upload_meta = {
+            "method": resp.get("_hermes_upload_method"),
+            "name": resp.get("_hermes_upload_name") or args.get("name"),
+            "size_bytes": resp.get("_hermes_upload_size"),
+        }
+        upload_meta = {k: v for k, v in upload_meta.items() if v not in (None, "")}
+        if upload_meta:
+            data = dict(data) if isinstance(data, dict) else {"data": data}
+            data["hermes_upload"] = upload_meta
         return tool_result(data)
     except Exception as e:
         return tool_error(str(e))

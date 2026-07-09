@@ -545,6 +545,32 @@ class NapCatAdapter(BasePlatformAdapter):
         # Original incoming message IDs that should receive a second reaction
         # after Hermes has successfully sent its visible reply.
         self._post_reply_reactions: set[str] = set()
+        # Chat -> message_id currently being processed.  BasePlatformAdapter's
+        # media batch path does not pass reply_to into send_image/send_voice, so
+        # use this as a plugin-local fallback to keep attachments/replies anchored
+        # to the message whose turn is actually running, not a later queued one.
+        self._active_reply_anchors: dict[str, str] = {}
+        # BasePlatformAdapter's queue-mode text debounce merges rapid TEXT
+        # follow-ups into one pending event and rewrites the event.message_id to
+        # the latest QQ message.  On QQ that makes quote-replies drift between
+        # queued messages.  Keep a plugin-local FIFO tail instead: the base
+        # pending slot remains the next turn; this tail holds later turns.
+        self._queued_text_followups: dict[str, list[MessageEvent]] = {}
+        # GatewayRunner may drain queued follow-ups inside one outer
+        # BasePlatformAdapter event: it sends intermediate "first responses"
+        # itself, then returns only the final queued response to Base, whose
+        # final delivery still carries the original event's reply anchor.  Track
+        # QQ message ids that arrive while a session is active so plugin-side
+        # sends can quote each inline/final response to the queued turn it
+        # actually answers, without patching Hermes core.
+        self._busy_followup_reply_anchors: dict[str, list[str]] = {}
+        self._next_final_reply_anchors: dict[str, str] = {}
+        # Reaction completion needs the same queued-anchor correction as quote
+        # replies.  GatewayRunner can send the first queued response inline and
+        # then deliver the final queued response through the outer event's
+        # on_processing_complete hook, whose event.message_id is stale.
+        self._inline_completion_reply_anchors: dict[str, str] = {}
+        self._pending_completion_reply_anchors: dict[str, str] = {}
 
         # Wire up qq_tool so the agent can call QQ APIs directly
         try:
@@ -814,6 +840,7 @@ class NapCatAdapter(BasePlatformAdapter):
             # Leaving user_name empty prevents the gateway from wrapping the
             # prefix again as `[[role]<QQ>] ...`.
             user_name="" if is_group else identity_label,
+            message_id=original_message_id or None,
         )
 
         role_zh = {"owner": "所有者", "admin": "管理员", "user": "普通用户"}.get(role, "普通用户")
@@ -989,20 +1016,193 @@ class NapCatAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """After successful delivery, replace processing reaction with done reaction."""
+        message_id = getattr(event, "message_id", None)
+        chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+        actual_message_id = self._pending_completion_reply_anchors.pop(chat_id, None) or message_id
+        if chat_id and message_id and self._active_reply_anchors.get(chat_id) == str(message_id):
+            self._active_reply_anchors.pop(chat_id, None)
         if outcome is not ProcessingOutcome.SUCCESS:
             return
-        message_id = getattr(event, "message_id", None)
         original_message_id = getattr(event, "_hermes_original_message_id", None)
-        if original_message_id and str(original_message_id) != str(message_id or ""):
+        stale_ids: set[str] = set()
+        if original_message_id and str(original_message_id) != str(actual_message_id or ""):
+            stale_ids.add(str(original_message_id))
+        if message_id and str(message_id) != str(actual_message_id or ""):
+            stale_ids.add(str(message_id))
+        for stale_id in stale_ids:
             # A queued follow-up may become the visible final reply target while
-            # the outer event was an older message.  Clear the stale processing
-            # reaction on the older message so QQ does not appear to complete the
-            # wrong item; mark completion on the actual final reply target below.
-            await self._clear_processing(str(original_message_id))
-            self._post_reply_reactions.discard(str(original_message_id))
-            self._post_reply_pokes.pop(str(original_message_id), None)
-        await self._clear_processing(message_id)
-        await self._mark_post_response(message_id)
+            # the outer event was an older message.  Clear stale processing
+            # reactions so QQ does not appear to complete the wrong item; mark
+            # completion on the actual final reply target below.
+            await self._clear_processing(stale_id)
+            self._post_reply_reactions.discard(stale_id)
+            self._post_reply_pokes.pop(stale_id, None)
+        await self._clear_processing(actual_message_id)
+        await self._mark_post_response(actual_message_id)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Remember the actual running turn's reply anchor for media sends."""
+        message_id = getattr(event, "message_id", None)
+        chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+        if chat_id and message_id:
+            self._active_reply_anchors[chat_id] = str(message_id)
+            while len(self._active_reply_anchors) > 256:
+                self._active_reply_anchors.pop(next(iter(self._active_reply_anchors)), None)
+        self._promote_queued_text_followup(event)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Record QQ follow-up anchors before Hermes core queues/drains them."""
+        try:
+            chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+            message_id = getattr(event, "message_id", None)
+            session_key = self._session_key_for_event(event)
+            if event.get_command() in {"new", "reset"} and chat_id:
+                self._busy_followup_reply_anchors.pop(chat_id, None)
+                self._next_final_reply_anchors.pop(chat_id, None)
+                self._inline_completion_reply_anchors.pop(chat_id, None)
+                self._pending_completion_reply_anchors.pop(chat_id, None)
+            elif chat_id and message_id and session_key in self._active_sessions:
+                anchors = self._busy_followup_reply_anchors.setdefault(chat_id, [])
+                msg = str(message_id)
+                if msg not in anchors and self._next_final_reply_anchors.get(chat_id) != msg:
+                    anchors.append(msg)
+                if len(anchors) > 32:
+                    del anchors[:-32]
+                logger.debug(
+                    "NapCat queued follow-up anchor recorded: chat=%s message_id=%s depth=%d",
+                    chat_id,
+                    msg,
+                    len(anchors),
+                )
+        except Exception:
+            pass
+        await super().handle_message(event)
+
+    def _session_key_for_event(self, event: MessageEvent) -> str:
+        return build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+
+    async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> None:
+        """Queue QQ text follow-ups as separate turns instead of merging text.
+
+        Hermes core's queue-mode debounce is useful for bursty platforms, but
+        QQ quote-replies are per message.  Merging multiple queued QQ texts into
+        one MessageEvent mutates message_id to the newest message, which can make
+        the first queued answer reply to the second message (or vice versa).
+        """
+        if session_key not in self._pending_messages:
+            self._pending_messages[session_key] = event
+            return
+        tail = self._queued_text_followups.setdefault(session_key, [])
+        tail.append(event)
+        if len(tail) > 32:
+            dropped = tail.pop(0)
+            logger.warning(
+                "NapCat queued text follow-up dropped at cap: session=%s message_id=%s",
+                session_key,
+                getattr(dropped, "message_id", "?"),
+            )
+
+    async def _flush_text_debounce_now(self, session_key: str) -> bool:
+        """No-op for NapCat text FIFO: _queue_text_debounce queues immediately."""
+        return False
+
+    def _discard_text_debounce(self, session_key: str) -> None:
+        super()._discard_text_debounce(session_key)
+        self._queued_text_followups.pop(session_key, None)
+
+    def _promote_queued_text_followup(self, event: MessageEvent) -> None:
+        """Move the next FIFO tail item into the base pending slot.
+
+        Called when a queued turn starts.  The base adapter has just popped the
+        pending slot for that running turn, so staging the next tail item here
+        lets the normal base drain cascade continue without modifying Hermes
+        core.
+        """
+        try:
+            session_key = self._session_key_for_event(event)
+        except Exception:
+            return
+        if session_key in self._pending_messages:
+            return
+        tail = self._queued_text_followups.get(session_key)
+        if not tail:
+            return
+        next_event = tail.pop(0)
+        if not tail:
+            self._queued_text_followups.pop(session_key, None)
+        self._pending_messages[session_key] = next_event
+
+    def _stage_next_final_reply_anchor(self, chat_id: str) -> str | None:
+        queued = self._busy_followup_reply_anchors.get(chat_id)
+        if not queued:
+            return None
+        staged = queued.pop(0)
+        self._next_final_reply_anchors[chat_id] = staged
+        if not queued:
+            self._busy_followup_reply_anchors.pop(chat_id, None)
+        return staged
+
+    def _effective_reply_to(
+        self,
+        chat_id: str,
+        reply_to: str | None = None,
+        metadata: dict | None = None,
+    ) -> str | None:
+        """Use the reply anchor for the turn actually being answered.
+
+        Hermes core's in-band queued-followup path can return the final queued
+        answer through the outer/original event.  For QQ quote replies, that
+        would reuse the first message's id.  We detect the two send shapes:
+        non-notify inline first-response sends advance the queued-anchor cursor;
+        notify final sends with the stale explicit anchor are redirected to the
+        staged queued id.
+        """
+        chat_key = str(chat_id)
+        notify = bool((metadata or {}).get("notify"))
+        active_anchor = self._active_reply_anchors.get(chat_key)
+
+        if reply_to:
+            explicit = str(reply_to)
+            staged = self._next_final_reply_anchors.get(chat_key)
+            if notify and staged and active_anchor and explicit == active_anchor:
+                self._next_final_reply_anchors.pop(chat_key, None)
+                self._pending_completion_reply_anchors[chat_key] = staged
+                logger.debug(
+                    "NapCat redirected queued final reply anchor: chat=%s %s -> %s",
+                    chat_key,
+                    explicit,
+                    staged,
+                )
+                return staged
+            return explicit
+
+        # Inline delivery before a queued follow-up is processed.  If a previous
+        # queued turn is now producing its own intermediate first response, use
+        # its staged anchor; otherwise use the currently active/original anchor.
+        anchor = self._next_final_reply_anchors.pop(chat_key, None) or active_anchor
+        if not notify:
+            staged = self._stage_next_final_reply_anchor(chat_key)
+            if staged and anchor:
+                self._inline_completion_reply_anchors[chat_key] = str(anchor)
+        return anchor
+
+    def _reply_segment_for(
+        self,
+        chat_id: str,
+        reply_to: str | None = None,
+        metadata: dict | None = None,
+    ) -> dict | None:
+        anchor = self._effective_reply_to(chat_id, reply_to, metadata)
+        if not anchor:
+            return None
+        try:
+            return reply_segment(int(anchor))
+        except (ValueError, TypeError):
+            return None
 
     def _start_private_typing(self, sender_id: str) -> asyncio.Task[None] | None:
         """Refresh QQ DM typing status while Hermes prepares a reply."""
@@ -1075,13 +1275,14 @@ class NapCatAdapter(BasePlatformAdapter):
     ) -> SendResult:
         try:
             is_group, num_id = self._parse_chat_id(chat_id)
+            effective_reply_to = self._effective_reply_to(chat_id, reply_to, metadata)
             chunks = _chunk_text(_strip_markdown(content))
             last_id: str | None = None
             for i, chunk in enumerate(chunks):
                 segs: list[dict] = []
-                if i == 0 and reply_to:
+                if i == 0 and effective_reply_to:
                     try:
-                        segs.append(reply_segment(int(reply_to)))
+                        segs.append(reply_segment(int(effective_reply_to)))
                     except (ValueError, TypeError):
                         pass
                 segs.append(text_segment(chunk))
@@ -1090,7 +1291,11 @@ class NapCatAdapter(BasePlatformAdapter):
                 else:
                     r = await send_private_msg(self._http_api, num_id, segs, self._access_token or None)
                 last_id = str(r.get("message_id", ""))
-            await self._poke_after_reply(reply_to)
+            inline_completion_anchor = self._inline_completion_reply_anchors.pop(str(chat_id), None)
+            if inline_completion_anchor and effective_reply_to and inline_completion_anchor == str(effective_reply_to):
+                await self._clear_processing(inline_completion_anchor)
+                await self._mark_post_response(inline_completion_anchor)
+            await self._poke_after_reply(effective_reply_to)
             return SendResult(success=True, message_id=last_id)
         except Exception as exc:
             logger.error("NapCat send error: %s", exc)
@@ -1101,11 +1306,16 @@ class NapCatAdapter(BasePlatformAdapter):
         chat_id: str,
         image_url: str,
         caption: str | None = None,
+        reply_to: str | None = None,
         metadata: dict | None = None,
     ) -> SendResult:
         try:
             is_group, num_id = self._parse_chat_id(chat_id)
-            segs: list[dict] = [image_segment(image_url)]
+            segs: list[dict] = []
+            reply_seg = self._reply_segment_for(chat_id, reply_to, metadata)
+            if reply_seg:
+                segs.append(reply_seg)
+            segs.append(image_segment(image_url))
             if caption:
                 segs.append(text_segment(caption))
             if is_group:
@@ -1116,15 +1326,37 @@ class NapCatAdapter(BasePlatformAdapter):
         except Exception as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
 
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict | None = None,
+    ) -> SendResult:
+        """Send a Hermes-local image by converting it to a base64 OneBot ref."""
+        return await self.send_image(
+            chat_id=chat_id,
+            image_url=image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     async def send_voice(
         self,
         chat_id: str,
         audio_path: str,
+        reply_to: str | None = None,
         metadata: dict | None = None,
     ) -> SendResult:
         try:
             is_group, num_id = self._parse_chat_id(chat_id)
-            segs = [record_segment(audio_path)]
+            segs = []
+            reply_seg = self._reply_segment_for(chat_id, reply_to, metadata)
+            if reply_seg:
+                segs.append(reply_seg)
+            segs.append(record_segment(audio_path))
             if is_group:
                 r = await send_group_msg(self._http_api, num_id, segs, self._access_token or None)
             else:
@@ -1137,11 +1369,16 @@ class NapCatAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         video_path: str,
+        reply_to: str | None = None,
         metadata: dict | None = None,
     ) -> SendResult:
         try:
             is_group, num_id = self._parse_chat_id(chat_id)
-            segs = [video_segment(video_path)]
+            segs = []
+            reply_seg = self._reply_segment_for(chat_id, reply_to, metadata)
+            if reply_seg:
+                segs.append(reply_seg)
+            segs.append(video_segment(video_path))
             if is_group:
                 r = await send_group_msg(self._http_api, num_id, segs, self._access_token or None)
             else:
@@ -1251,10 +1488,8 @@ def register(ctx) -> None:
     # Importing this module registers qq_* tools into the dynamic "napcat"
     # toolset. The adapter initializes its HTTP endpoint/admin context at runtime.
     from . import qq_tool as _qq_tool  # noqa: F401
-    from .qqbot_native import register_qqbot_native
 
     ctx.register_hook("pre_tool_call", _napcat_acl_pre_tool_call)
-    register_qqbot_native(ctx)
 
     ctx.register_platform(
         name="napcat",
