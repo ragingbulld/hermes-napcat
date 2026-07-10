@@ -7,7 +7,9 @@ and access token.  All handlers are async (is_async=True).
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
 
 import aiohttp
@@ -28,8 +30,6 @@ _http_api: str = ""
 _access_token: str = ""
 _admins: list[str] = []
 _owners: list[str] = []
-_current_sender: str = ""
-_current_role: str = "user"
 
 
 def _init(http_api: str, access_token: str = "", owners: list[str] | None = None, admins: list[str] | None = None) -> None:
@@ -38,13 +38,6 @@ def _init(http_api: str, access_token: str = "", owners: list[str] | None = None
     _access_token = access_token
     _owners = [str(a) for a in (owners or [])]
     _admins = [str(a) for a in (admins or [])]
-
-
-def _set_context(sender_id: str, role: str = "user") -> None:
-    """Called by the adapter before each message to set the current user context."""
-    global _current_sender, _current_role
-    _current_sender = sender_id
-    _current_role = role
 
 
 def _role_for_sender(sender_id: str) -> str:
@@ -57,7 +50,7 @@ def _role_for_sender(sender_id: str) -> str:
 
 
 def _current_identity() -> tuple[str, str]:
-    """Return (sender_id, role), preferring session ContextVars over globals."""
+    """Return a verified NapCat identity, failing closed if unavailable."""
     try:
         from gateway.session_context import get_session_env
 
@@ -67,7 +60,7 @@ def _current_identity() -> tuple[str, str]:
                 return sender, _role_for_sender(sender)
     except Exception:
         pass
-    return _current_sender, _current_role
+    return "", "user"
 
 
 def _check() -> str | None:
@@ -78,23 +71,22 @@ def _check() -> str | None:
 
 
 def _normalize_message_media_segments(message: Any) -> Any:
-    """Convert Hermes-local image/audio/video segment files to base64 refs."""
-    if not isinstance(message, list):
+    """Recursively convert Hermes-local media segment files to base64 refs."""
+    if isinstance(message, list):
+        return [_normalize_message_media_segments(item) for item in message]
+    if not isinstance(message, dict):
         return message
-    normalized: list[Any] = []
-    for segment in message:
-        if not isinstance(segment, dict):
-            normalized.append(segment)
-            continue
-        seg = dict(segment)
-        seg_type = str(seg.get("type") or "").lower()
-        data = seg.get("data")
-        if seg_type in {"image", "record", "video"} and isinstance(data, dict):
-            new_data = dict(data)
-            if "file" in new_data:
-                new_data["file"] = normalize_media_reference(str(new_data.get("file") or ""))
-            seg["data"] = new_data
-        normalized.append(seg)
+    normalized = {
+        key: _normalize_message_media_segments(value)
+        for key, value in message.items()
+    }
+    seg_type = str(normalized.get("type") or "").lower()
+    data = normalized.get("data")
+    if seg_type in {"image", "record", "video"} and isinstance(data, dict):
+        new_data = dict(data)
+        if "file" in new_data:
+            new_data["file"] = normalize_media_reference(str(new_data.get("file") or ""))
+        normalized["data"] = new_data
     return normalized
 
 
@@ -119,6 +111,7 @@ async def _call(endpoint: str, **params: Any) -> dict:
             url, json=body, headers=headers,
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
+            resp.raise_for_status()
             data = await resp.json(content_type=None)
     retcode = data.get("retcode", 0)
     if retcode != 0:
@@ -128,6 +121,70 @@ async def _call(endpoint: str, **params: Any) -> dict:
 
 
 # ── Schema helpers ─────────────────────────────────────────────────────────────
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_FORBIDDEN_DOWNLOAD_HEADERS = {
+    "connection", "content-length", "host", "keep-alive", "proxy-authorization",
+    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
+}
+
+
+def _parse_download_headers(value: Any) -> dict[str, str]:
+    """Parse bounded user headers without allowing routing/hop-by-hop overrides."""
+    if value in (None, "", []):
+        return {}
+    items: list[Any] = []
+    if isinstance(value, dict):
+        items = list(value.items())
+    else:
+        raw_items: Any = value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{"):
+                parsed = json.loads(stripped)
+                if not isinstance(parsed, dict):
+                    raise ValueError("download headers JSON must be an object")
+                items = list(parsed.items())
+                raw_items = None
+            else:
+                raw_items = [line for line in stripped.splitlines() if line.strip()]
+        if raw_items is not None:
+            if not isinstance(raw_items, (list, tuple)):
+                raise ValueError("download headers must be a list of 'Name: value' strings")
+            items = []
+            for raw in raw_items:
+                text = str(raw)
+                separator = ":" if ":" in text else "=" if "=" in text else ""
+                if not separator:
+                    raise ValueError("download header must use 'Name: value' syntax")
+                items.append(text.split(separator, 1))
+    if len(items) > 32:
+        raise ValueError("too many download headers (max 32)")
+    headers: dict[str, str] = {}
+    total = 0
+    for raw_name, raw_value in items:
+        name = str(raw_name).strip()
+        header_value = str(raw_value).strip()
+        if not name or not _HEADER_NAME_RE.fullmatch(name):
+            raise ValueError(f"invalid download header name: {name!r}")
+        if name.lower() in _FORBIDDEN_DOWNLOAD_HEADERS:
+            raise ValueError(f"download header is not allowed: {name}")
+        if "\r" in header_value or "\n" in header_value:
+            raise ValueError(f"invalid newline in download header: {name}")
+        total += len(name) + len(header_value)
+        if len(header_value) > 8192 or total > 16384:
+            raise ValueError("download headers are too large")
+        headers[name] = header_value
+    return headers
+
 
 def _schema(name: str, desc: str, props: dict, required: list[str] | None = None) -> dict:
     return {
@@ -320,12 +377,18 @@ async def _qq_send_group_forward_msg(args: dict, **_) -> str:
     if err:
         return tool_error(err)
     try:
-        data = await _call(
+        response = await call_onebot_api_with_media_fallback(
+            _http_api,
             "send_group_forward_msg",
-            group_id=int(args["group_id"]),
-            messages=args["messages"],
+            {
+                "group_id": int(args["group_id"]),
+                "messages": _normalize_message_media_segments(args["messages"]),
+            },
+            access_token=_access_token or None,
+            timeout=30,
+            message_key="messages",
         )
-        return tool_result(data)
+        return tool_result(response.get("data") or {})
     except Exception as e:
         return tool_error(str(e))
 
@@ -356,12 +419,18 @@ async def _qq_send_private_forward_msg(args: dict, **_) -> str:
     if err:
         return tool_error(err)
     try:
-        data = await _call(
+        response = await call_onebot_api_with_media_fallback(
+            _http_api,
             "send_private_forward_msg",
-            user_id=int(args["user_id"]),
-            messages=args["messages"],
+            {
+                "user_id": int(args["user_id"]),
+                "messages": _normalize_message_media_segments(args["messages"]),
+            },
+            access_token=_access_token or None,
+            timeout=30,
+            message_key="messages",
         )
-        return tool_result(data)
+        return tool_result(response.get("data") or {})
     except Exception as e:
         return tool_error(str(e))
 
@@ -399,8 +468,8 @@ async def _qq_get_group_msg_history(args: dict, **_) -> str:
         data = await _call(
             "get_group_msg_history",
             group_id=int(args["group_id"]),
-            message_id=args.get("message_id"),
-            count=int(args.get("count", 20)),
+            message_seq=int(args["message_seq"]) if args.get("message_seq") is not None else None,
+            count=_bounded_int(args.get("count"), default=20, minimum=1, maximum=100),
         )
         return tool_result(data)
     except Exception as e:
@@ -416,7 +485,7 @@ registry.register(
         "qq_get_group_msg_history", "Fetch recent message history from a group.",
         {
             "group_id": _str("Group ID"),
-            "message_id": _str("Fetch messages before this message_id (optional)"),
+            "message_seq": _str("Fetch messages before this message sequence (optional)"),
             "count": _int("Number of messages to fetch (default 20, max 100)"),
         },
         required=["group_id"],
@@ -432,8 +501,8 @@ async def _qq_get_friend_msg_history(args: dict, **_) -> str:
         data = await _call(
             "get_friend_msg_history",
             user_id=int(args["user_id"]),
-            message_id=args.get("message_id"),
-            count=int(args.get("count", 20)),
+            message_seq=int(args["message_seq"]) if args.get("message_seq") is not None else None,
+            count=_bounded_int(args.get("count"), default=20, minimum=1, maximum=100),
         )
         return tool_result(data)
     except Exception as e:
@@ -449,7 +518,7 @@ registry.register(
         "qq_get_friend_msg_history", "Fetch recent message history with a friend.",
         {
             "user_id": _str("Friend QQ number"),
-            "message_id": _str("Fetch messages before this message_id (optional)"),
+            "message_seq": _str("Fetch messages before this message sequence (optional)"),
             "count": _int("Number of messages to fetch (default 20)"),
         },
         required=["user_id"],
@@ -585,7 +654,7 @@ async def _qq_like_user(args: dict, **_) -> str:
         await _call(
             "send_like",
             user_id=int(args["user_id"]),
-            times=int(args.get("times", 1)),
+            times=_bounded_int(args.get("times"), default=1, minimum=1, maximum=10),
         )
         return tool_result(success=True)
     except Exception as e:
@@ -614,7 +683,7 @@ async def _qq_set_friend_remark(args: dict, **_) -> str:
         return tool_error(err)
     try:
         await _call(
-            "set_friend_add_request",
+            "set_friend_remark",
             user_id=int(args["user_id"]),
             remark=args.get("remark", ""),
         )
@@ -1210,10 +1279,15 @@ async def _qq_set_group_portrait(args: dict, **_) -> str:
     if err:
         return tool_error(err)
     try:
-        await _call(
+        await call_onebot_api_with_local_file_url_fallback(
+            _http_api,
             "set_group_portrait",
-            group_id=int(args["group_id"]),
-            file=args["file"],
+            {
+                "group_id": int(args["group_id"]),
+                "file": args["file"],
+            },
+            _access_token or None,
+            file_key="file",
         )
         return tool_result(success=True)
     except Exception as e:
@@ -1280,12 +1354,21 @@ async def _qq_send_group_notice(args: dict, **_) -> str:
     if err:
         return tool_error(err)
     try:
-        await _call(
-            "_send_group_notice",
-            group_id=int(args["group_id"]),
-            content=args["content"],
-            image=args.get("image", ""),
-        )
+        params = {
+            "group_id": int(args["group_id"]),
+            "content": args["content"],
+            "image": args.get("image", ""),
+        }
+        if params["image"]:
+            await call_onebot_api_with_local_file_url_fallback(
+                _http_api,
+                "_send_group_notice",
+                params,
+                _access_token or None,
+                file_key="image",
+            )
+        else:
+            await _call("_send_group_notice", **params)
         return tool_result(success=True)
     except Exception as e:
         return tool_error(str(e))
@@ -1557,13 +1640,16 @@ async def _qq_download_file(args: dict, **_) -> str:
     if err:
         return tool_error(err)
     try:
-        data = await _call(
+        headers = _parse_download_headers(args.get("headers"))
+        response = await call_onebot_api_with_local_file_url_fallback(
+            _http_api,
             "download_file",
-            url=args["url"],
-            thread_count=int(args.get("thread_count", 1)),
-            headers=args.get("headers", ""),
+            {"url": args["url"], "thread_count": 1},
+            _access_token or None,
+            file_key="url",
+            download_headers=headers,
         )
-        return tool_result(data)
+        return tool_result(response.get("data") or {})
     except Exception as e:
         return tool_error(str(e))
 
@@ -1575,11 +1661,15 @@ registry.register(
     handler=_qq_download_file,
     schema=_schema(
         "qq_download_file",
-        "Ask NapCat to download a file from a URL and return the local path.",
+        "Safely download a public URL through Hermes, transfer it to NapCat, and return NapCat's local path.",
         {
-            "url": _str("URL to download"),
-            "thread_count": _int("Download threads (default 1)"),
-            "headers": _str("Extra HTTP headers as a string (optional)"),
+            "url": _str("Public HTTP(S) URL to download"),
+            "thread_count": _int("Compatibility input; the secured transfer uses one thread"),
+            "headers": {
+                "type": "array",
+                "description": "Optional HTTP headers as 'Name: value' strings",
+                "items": {"type": "string"},
+            },
         },
         required=["url"],
     ),
@@ -1595,8 +1685,14 @@ async def _qq_ocr_image(args: dict, **_) -> str:
     if err:
         return tool_error(err)
     try:
-        data = await _call("ocr_image", image=args["image"])
-        return tool_result(data)
+        resp = await call_onebot_api_with_local_file_url_fallback(
+            _http_api,
+            "ocr_image",
+            {"image": args["image"]},
+            _access_token or None,
+            file_key="image",
+        )
+        return tool_result(resp.get("data") or {})
     except Exception as e:
         return tool_error(str(e))
 
@@ -1662,7 +1758,7 @@ async def _qq_translate_en2zh(args: dict, **_) -> str:
     if err:
         return tool_error(err)
     try:
-        data = await _call("get_word_slices", content=args["content"])
+        data = await _call("translate_en2zh", words=[args["content"]])
         return tool_result(data)
     except Exception as e:
         return tool_error(str(e))

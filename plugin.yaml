@@ -1,10 +1,10 @@
 name: hermes-napcat
 label: NapCat / OneBot 11
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
-  Out-of-tree Hermes Agent gateway adapter for QQ via NapCat / OneBot 11 reverse WebSocket.
-  Supports sender allowlists for both private chats and groups without modifying Hermes core source.
+  Out-of-tree Hermes Agent gateway adapter for QQ via an authenticated NapCat / OneBot 11 reverse WebSocket.
+  Supports QQ-number owner/admin ACLs and chat-scoped group allowlists without modifying Hermes core source.
 author: ragingbulld
 optional_env:
   - name: NAPCAT_ALLOWED_USERS

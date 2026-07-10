@@ -10,8 +10,8 @@ Configuration in ~/.hermes/config.yaml:
         enabled: true
         extra:
           http_api: "http://127.0.0.1:18801"
-          access_token: ""
-          self_id: "123456789"
+          access_token: "<required-high-entropy-token>"
+          self_id: "<BOT_QQ_ID>"
           ws_port: 18800
           owners: []                 # QQ numbers with full owner permission
           admins: []                 # QQ numbers allowed to run dangerous operations
@@ -32,13 +32,16 @@ Configuration in ~/.hermes/config.yaml:
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from contextlib import suppress
+import hmac
 import json
 import logging
 import os
 import re
 import subprocess
 import tempfile
+import unicodedata
 from datetime import datetime
 from typing import Any, Optional
 
@@ -58,6 +61,7 @@ from gateway.session import SessionSource, build_session_key
 
 from .napcat_api import (
     call_onebot_api,
+    download_public_url_bytes,
     get_login_info,
     get_msg,
     image_segment,
@@ -85,6 +89,29 @@ _OWNER_ONLY_TOOLS = {
 _USER_ALLOWED_TOOLS: set[str] = set()
 
 
+def _ws_token_is_valid(
+    expected_token: str,
+    authorization_header: str | None,
+    query_token: str | None,
+) -> bool:
+    """Validate the token sent by a OneBot reverse-WebSocket client."""
+    expected = str(expected_token or "")
+    if not expected:
+        return False
+    header = str(authorization_header or "").strip()
+    presented = str(query_token or "")
+    if header.lower().startswith("bearer "):
+        presented = header[7:].strip()
+    return bool(presented) and hmac.compare_digest(presented, expected)
+
+
+def _event_matches_self_id(event: dict[str, Any], expected_self_id: str) -> bool:
+    """Reject events that claim to originate from a different QQ bot."""
+    expected = str(expected_self_id or "")
+    actual = str((event or {}).get("self_id", "") or "")
+    return bool(expected and actual and hmac.compare_digest(actual, expected))
+
+
 def _as_bool(value: Any, default: bool = False) -> bool:
     """Coerce bool-ish config values without treating arbitrary strings as true."""
     if value is None:
@@ -109,6 +136,22 @@ def _as_str_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(part).strip() for part in value if str(part).strip()]
     return [str(value).strip()] if str(value).strip() else []
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
 
 
 def _load_acl_config() -> tuple[set[str], set[str], set[str]]:
@@ -175,17 +218,97 @@ def _safe_identity_part(value: str, *, max_len: int = 32) -> str:
     return cleaned
 
 
-def _sender_identity_label(role: str, user_id: str, display_name: str) -> str:
-    """Return the model-visible sender prefix used by shared group sessions.
+def _safe_display_name(value: str, *, max_len: int = 24) -> str:
+    """Render a mutable QQ card as a one-line, non-structural decoration."""
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    cleaned = "".join(
+        char for char in normalized if unicodedata.category(char) not in {"Cc", "Cf"}
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned.translate(
+        str.maketrans({
+            "[": "［", "]": "］", "<": "＜", ">": "＞",
+            "「": "｢", "」": "｣",
+        })
+    )
+    if len(cleaned) > max_len:
+        cleaned = cleaned[: max_len - 1] + "…"
+    return cleaned
 
-    QQ nicknames/cards are user-controlled and can collide, so they are not
-    included in the model-visible identity.  Use an MC-chat-like speaker prefix,
-    e.g. ``[owner]<123456>``, to make it obvious this is who is speaking.
-    """
-    _ = display_name  # Deliberately ignored: display names are not authority.
+
+def _sender_identity_label(role: str, user_id: str, display_name: str) -> str:
+    """Return a trusted QQ identity core plus an optional safe card decoration."""
     role_label = {"owner": "owner", "admin": "admin", "user": "user"}.get(role, "user")
     qq = _safe_identity_part(user_id, max_len=20) or "unknown"
-    return f"[{role_label}]<{qq}>"
+    stable = f"[{role_label}]<{qq}>"
+    card = _safe_display_name(display_name)
+    if not card or card == qq:
+        return stable
+    return f"{stable}「{card}」"
+
+
+def _group_media_attribution_text(
+    text: str,
+    identity_label: str,
+    *,
+    has_image: bool,
+    has_voice: bool,
+) -> str:
+    """Keep captionless group media attributable after vision/transcription."""
+    if str(text or "").strip():
+        return text
+    return _captionless_media_context(
+        text,
+        identity_label,
+        has_image=has_image,
+        has_voice=has_voice,
+    )
+
+
+def _captionless_media_context(
+    text: str,
+    identity_label: str,
+    *,
+    has_image: bool,
+    has_voice: bool,
+) -> str:
+    """Append a media marker without duplicating the current speaker label."""
+    if has_image:
+        marker = "[发送了图片]"
+    elif has_voice:
+        marker = "[发送了语音]"
+    else:
+        return text
+    if str(text or "").strip():
+        return f"{text.rstrip()}\n{marker}"
+    return f"{identity_label} {marker}"
+
+
+def _quoted_message_context(
+    identity_label: str,
+    quoted_text: str,
+    quoted_segments: list[dict],
+) -> tuple[str, str]:
+    """Describe a quoted QQ message even when it has no extractable text."""
+    content = str(quoted_text or "").strip()
+    if content:
+        return (
+            f"[引用 {identity_label} 的消息: {content}]",
+            f"{identity_label}: {content}",
+        )
+    types = {str(segment.get("type") or "") for segment in quoted_segments or []}
+    if "image" in types:
+        kind = "图片消息"
+    elif "record" in types:
+        kind = "语音消息"
+    elif "video" in types:
+        kind = "视频消息"
+    elif "file" in types:
+        kind = "文件消息"
+    else:
+        kind = "消息"
+    summary = f"{identity_label} 的{kind}"
+    return f"[引用 {summary}]", summary
 
 
 def _napcat_acl_pre_tool_call(tool_name: str, **_: Any) -> dict | None:
@@ -196,9 +319,31 @@ def _napcat_acl_pre_tool_call(tool_name: str, **_: Any) -> dict | None:
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         user_id = get_session_env("HERMES_SESSION_USER_ID", "")
     except Exception:
+        if tool_name.startswith("qq_"):
+            return {
+                "action": "block",
+                "message": "NapCat 权限校验失败：会话身份上下文不可用。",
+            }
+        return None
+    if not platform:
+        if tool_name.startswith("qq_"):
+            return {
+                "action": "block",
+                "message": "NapCat 权限校验失败：QQ 工具缺少会话身份上下文。",
+            }
         return None
     if platform != "napcat":
+        if tool_name.startswith("qq_"):
+            return {
+                "action": "block",
+                "message": "NapCat 权限校验失败：QQ 工具只能从 NapCat 身份会话调用。",
+            }
         return None
+    if not user_id:
+        return {
+            "action": "block",
+            "message": "NapCat 权限校验失败：会话用户身份缺失。",
+        }
 
     owners, admins, _ = _load_acl_config()
     role = _role_for_user(user_id, owners, admins)
@@ -397,6 +542,27 @@ def _strip_bot_mention(segments: list[dict], self_id: str) -> list[dict]:
     ]
 
 
+def _collect_bot_mention_names(
+    configured_names: list[str],
+    login_nickname: str,
+    group_member: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return de-duplicated bot aliases, including its current group card."""
+    member = group_member or {}
+    candidates = [
+        *configured_names,
+        login_nickname,
+        str(member.get("card") or ""),
+        str(member.get("nickname") or ""),
+    ]
+    names: list[str] = []
+    for candidate in candidates:
+        name = str(candidate or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def _strip_textual_bot_mention(text: str, names: list[str]) -> tuple[bool, str]:
     """Accept QQ clients that emit ``@[灵溪] text`` as plain text.
 
@@ -406,7 +572,10 @@ def _strip_textual_bot_mention(text: str, names: list[str]) -> tuple[bool, str]:
     ``问下灵溪`` still does not trigger when ``require_mention`` is enabled.
     """
     raw = str(text or "").lstrip()
-    for name in names:
+    # Prefer the longest configured name when aliases overlap (for example,
+    # "灵溪" and the group card "灵溪灵溪灵").  Matching the short alias first
+    # would leave the unmatched suffix in the user's message.
+    for name in sorted(names, key=len, reverse=True):
         escaped = re.escape(name)
         pattern = rf"^@\s*(?:\[{escaped}\]|{escaped})(?:\s+|[:,，：、]?\s*)"
         match = re.match(pattern, raw)
@@ -434,29 +603,52 @@ def _chunk_text(text: str, limit: int = _QQ_TEXT_LIMIT) -> list[str]:
 
 
 async def _download_and_convert_wav(url: str, max_bytes: int) -> str | None:
+    in_path = ""
+    out_path = ""
+    success = False
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                data = await resp.read()
-        if len(data) > max_bytes:
-            return None
+        data = await download_public_url_bytes(url, max_bytes=max_bytes, timeout=25)
         fd, in_path = tempfile.mkstemp(suffix=".silk")
         os.close(fd)
         out_path = in_path.replace(".silk", ".wav")
         with open(in_path, "wb") as f:
             f.write(data)
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", in_path, "-ar", "16000", "-ac", "1", "-f", "wav", out_path],
-            capture_output=True, timeout=15,
+        max_seconds = max(1, min(600, max_bytes // 32000))
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "ffmpeg", "-y", "-i", in_path,
+                "-t", str(max_seconds),
+                "-ar", "16000", "-ac", "1", "-f", "wav", out_path,
+            ],
+            capture_output=True,
+            timeout=15,
         )
-        os.unlink(in_path)
-        if result.returncode != 0:
+        if result.returncode != 0 or os.path.getsize(out_path) > max_bytes + 4096:
             return None
+        success = True
         return out_path
     except Exception as exc:
         logger.debug("Voice download/convert failed: %s", exc)
         return None
+    finally:
+        if in_path:
+            with suppress(OSError):
+                os.unlink(in_path)
+        if out_path and not success:
+            with suppress(OSError):
+                os.unlink(out_path)
+
+
+def _cleanup_event_temp_media(event: Any) -> None:
+    metadata = getattr(event, "metadata", None)
+    paths = list(metadata.pop("_napcat_temp_media_paths", ()) if isinstance(metadata, dict) else ())
+    paths.extend(getattr(event, "_napcat_temp_media_paths", ()) or ())
+    if hasattr(event, "_napcat_temp_media_paths"):
+        setattr(event, "_napcat_temp_media_paths", [])
+    for path in paths:
+        with suppress(OSError):
+            os.unlink(path)
 
 
 def check_napcat_requirements() -> bool:
@@ -504,7 +696,29 @@ class NapCatAdapter(BasePlatformAdapter):
         raw_self_id = str(extra.get("self_id", ""))
         # Treat placeholder values as empty so HTTP probe fills in real QQ
         self._self_id: str = "" if raw_self_id in ("YOUR_QQ_NUMBER", "YOURQQ_NUMBER") else raw_self_id
-        self._ws_port: int = int(extra.get("ws_port", 18800))
+        self._ws_port: int = _bounded_int(
+            extra.get("ws_port", 18800), default=18800, minimum=1, maximum=65535
+        )
+        self._ws_host: str = str(extra.get("ws_host", "0.0.0.0") or "0.0.0.0")
+        self._ws_access_token: str = str(
+            extra.get("ws_access_token", self._access_token) or ""
+        )
+        self._ws_allowed_ips: set[str] = set(_as_str_list(extra.get("ws_allowed_ips")))
+        self._ws_max_message_bytes: int = _bounded_int(
+            extra.get("ws_max_message_bytes", 2 * 1024 * 1024),
+            default=2 * 1024 * 1024,
+            minimum=64 * 1024,
+            maximum=16 * 1024 * 1024,
+        )
+        self._ws_heartbeat_seconds: float = _bounded_float(
+            extra.get("ws_heartbeat_seconds", 30),
+            default=30.0,
+            minimum=5.0,
+            maximum=300.0,
+        )
+        self._ws_max_inflight: int = _bounded_int(
+            extra.get("ws_max_inflight", 32), default=32, minimum=1, maximum=256
+        )
         # Keep SessionSource.platform equal to the real adapter platform.
         # A previous Desktop grouping workaround aliased NapCat messages as
         # qqbot, but the gateway then applied qqbot authorization instead of
@@ -529,7 +743,18 @@ class NapCatAdapter(BasePlatformAdapter):
         ]
         # Group trigger policy. Current deployment wants group messages to
         # mention the bot before Hermes replies; DMs still use sender allowlist.
-        self._mention_names: list[str] = _as_str_list(extra.get("mention_names")) or ["灵溪", "灵溪灵溪灵"]
+        # Optional textual aliases. Real OneBot ``at`` segments are matched by
+        # QQ number; plain-text @ fallbacks also learn the login nickname and the
+        # bot's current per-group card dynamically.
+        self._mention_names: list[str] = _as_str_list(extra.get("mention_names"))
+        self._login_nickname: str = ""
+        self._mention_name_cache_seconds: float = max(
+            0.0, float(extra.get("mention_name_cache_seconds", 300))
+        )
+        self._group_mention_name_cache: OrderedDict[str, tuple[float, list[str]]] = OrderedDict()
+        self._group_mention_name_cache_max: int = _bounded_int(
+            extra.get("mention_name_cache_max", 512), default=512, minimum=16, maximum=4096
+        )
         self._require_mention: bool = _as_bool(
             extra.get("group_require_mention", extra.get("require_mention", False)),
             default=False,
@@ -560,6 +785,8 @@ class NapCatAdapter(BasePlatformAdapter):
 
         self._runner: aiohttp.web.AppRunner | None = None
         self._active_ws: set[aiohttp.web.WebSocketResponse] = set()
+        self._raw_tasks: set[asyncio.Task[None]] = set()
+        self._seen_message_ids: OrderedDict[str, float] = OrderedDict()
         # Maps original incoming message_id -> (sender QQ, group_id or "").
         # send() consumes this after it successfully sends the reply, so the
         # post-processing poke happens after the visible answer is delivered.
@@ -607,20 +834,32 @@ class NapCatAdapter(BasePlatformAdapter):
         if not self._http_api:
             logger.error("NapCat: http_api is not configured")
             return False
+        if not self._ws_access_token:
+            logger.error("NapCat: refusing reverse-WebSocket listener without an access token")
+            return False
+        if self._runner is not None:
+            logger.debug("NapCat: reverse WS listener is already running")
+            return True
 
         app = aiohttp.web.Application()
         app.router.add_get("/", self._ws_handler)
         self._runner = aiohttp.web.AppRunner(app)
-        await self._runner.setup()
-        site = aiohttp.web.TCPSite(self._runner, "0.0.0.0", self._ws_port)
-        await site.start()
+        try:
+            await self._runner.setup()
+            site = aiohttp.web.TCPSite(self._runner, self._ws_host, self._ws_port)
+            await site.start()
+        except Exception:
+            await self._runner.cleanup()
+            self._runner = None
+            raise
         self._is_connected = True
-        logger.info("NapCat: reverse WS listening on ws://0.0.0.0:%d", self._ws_port)
+        logger.info("NapCat: reverse WS listening on ws://%s:%d", self._ws_host, self._ws_port)
 
         try:
             info = await get_login_info(self._http_api, self._access_token or None)
             if not self._self_id:
                 self._self_id = str(info.get("user_id", ""))
+            self._login_nickname = str(info.get("nickname") or "").strip()
             logger.info(
                 "NapCat: bot is %s (QQ:%s)",
                 info.get("nickname", "?"), info.get("user_id", "?"),
@@ -635,6 +874,12 @@ class NapCatAdapter(BasePlatformAdapter):
         for ws in list(self._active_ws):
             await ws.close()
         self._active_ws.clear()
+        tasks = list(self._raw_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._raw_tasks.clear()
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -643,14 +888,41 @@ class NapCatAdapter(BasePlatformAdapter):
     # ── Inbound WS handler ─────────────────────────────────────────────────
 
     async def _ws_handler(self, request: aiohttp.web.Request) -> aiohttp.web.WebSocketResponse:
-        ws = aiohttp.web.WebSocketResponse()
+        remote = str(request.remote or "")
+        if self._ws_allowed_ips and remote not in self._ws_allowed_ips:
+            logger.warning("NapCat WS rejected from untrusted IP %s", remote or "?")
+            raise aiohttp.web.HTTPForbidden(text="untrusted reverse-WebSocket source")
+        if not _ws_token_is_valid(
+            self._ws_access_token,
+            request.headers.get("Authorization"),
+            request.query.get("access_token"),
+        ):
+            logger.warning("NapCat WS rejected: invalid token from %s", remote or "?")
+            raise aiohttp.web.HTTPUnauthorized(text="invalid reverse-WebSocket token")
+
+        for old_ws in list(self._active_ws):
+            await old_ws.close(code=1008, message=b"replaced by authenticated peer")
+        self._active_ws.clear()
+
+        ws = aiohttp.web.WebSocketResponse(
+            max_msg_size=self._ws_max_message_bytes,
+            heartbeat=self._ws_heartbeat_seconds,
+        )
         await ws.prepare(request)
         self._active_ws.add(ws)
-        logger.info("NapCat WS connected from %s", request.remote)
+        logger.info("NapCat authenticated WS connected from %s", remote)
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
-                    asyncio.create_task(self._handle_raw(msg.data))
+                    if len(self._raw_tasks) >= self._ws_max_inflight:
+                        logger.warning(
+                            "NapCat WS frame dropped at inflight cap=%d",
+                            self._ws_max_inflight,
+                        )
+                        continue
+                    task = asyncio.create_task(self._handle_raw(msg.data))
+                    self._raw_tasks.add(task)
+                    task.add_done_callback(self._raw_tasks.discard)
                 elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                     break
         finally:
@@ -663,12 +935,88 @@ class NapCatAdapter(BasePlatformAdapter):
             data: dict = json.loads(raw)
         except json.JSONDecodeError:
             return
+        if not isinstance(data, dict):
+            return
+        if not _event_matches_self_id(data, self._self_id):
+            logger.warning(
+                "NapCat event rejected: self_id=%r expected=%r",
+                data.get("self_id"),
+                self._self_id,
+            )
+            return
         if data.get("post_type") != "message":
             return
+        message_id = str(data.get("message_id", "") or "")
+        if message_id:
+            now = asyncio.get_running_loop().time()
+            cutoff = now - 600.0
+            while self._seen_message_ids:
+                _, seen_at = next(iter(self._seen_message_ids.items()))
+                if seen_at >= cutoff:
+                    break
+                self._seen_message_ids.popitem(last=False)
+            if message_id in self._seen_message_ids:
+                logger.debug("NapCat duplicate message ignored: %s", message_id)
+                return
+            self._seen_message_ids[message_id] = now
+            while len(self._seen_message_ids) > 4096:
+                self._seen_message_ids.popitem(last=False)
         try:
             await self._process_message(data)
         except Exception:
             logger.exception("NapCat: error processing message")
+
+    async def _get_group_mention_names(self, group_id: str) -> list[str]:
+        """Return textual @ aliases for the bot in one group.
+
+        OneBot ``at`` segments are always matched by the bot QQ number. This
+        lookup is only for clients/copy paths that flatten an @ mention into
+        plain text, where the bot's per-group card is needed to remove the full
+        visible name. Results are cached briefly so ordinary group traffic does
+        not call NapCat for every message.
+        """
+        now = asyncio.get_running_loop().time()
+        cached = self._group_mention_name_cache.get(group_id)
+        if cached and cached[0] > now:
+            self._group_mention_name_cache.move_to_end(group_id)
+            return cached[1]
+        if cached:
+            self._group_mention_name_cache.pop(group_id, None)
+
+        member: dict[str, Any] = {}
+        if self._http_api and self._self_id and group_id:
+            try:
+                response = await call_onebot_api(
+                    self._http_api,
+                    "get_group_member_info",
+                    {
+                        "group_id": int(group_id),
+                        "user_id": int(self._self_id),
+                        "no_cache": True,
+                    },
+                    self._access_token or None,
+                )
+                member = response.get("data") or {}
+            except Exception as exc:
+                logger.debug(
+                    "NapCat: failed to fetch bot group card for group %s: %s",
+                    group_id,
+                    exc,
+                )
+
+        names = _collect_bot_mention_names(
+            self._mention_names,
+            self._login_nickname,
+            member,
+        )
+        self._group_mention_name_cache[group_id] = (
+            now + self._mention_name_cache_seconds,
+            names,
+        )
+        self._group_mention_name_cache.move_to_end(group_id)
+        while len(self._group_mention_name_cache) > self._group_mention_name_cache_max:
+            self._group_mention_name_cache.popitem(last=False)
+        return names
 
     async def _process_message(self, event: dict) -> None:
         is_group = event.get("message_type") == "group"
@@ -681,16 +1029,28 @@ class NapCatAdapter(BasePlatformAdapter):
         mentioned = False
         textual_mention_text: str | None = None
 
-        # Group mention handling. This deployment gates groups by both sender
-        # allowlist and @ mention; DMs still use only the sender allowlist.
+        # Authorize before mention-name lookup so rejected groups cannot consume
+        # NapCat HTTP calls or grow the per-group alias cache.
+        owners = set(self._owners)
+        admins = set(self._admins)
+        role = _role_for_user(sender_id, owners, admins)
+        identity_label = _sender_identity_label(role, sender_id, sender_name)
+        if is_group:
+            if not self._group_allow_chats or group_id not in self._group_allow_chats:
+                return
+        elif role not in {"owner", "admin"}:
+            return
+
+        # Group mention handling. This deployment gates groups by chat allowlist
         # Set require_mention/group_require_mention false to allow whitelisted
         # users to trigger the bot in groups without @.
         if is_group:
             mentioned = bool(self._self_id and _has_bot_mention(segments, self._self_id))
             if not mentioned:
+                mention_names = await self._get_group_mention_names(group_id)
                 textual_mentioned, stripped = _strip_textual_bot_mention(
                     _extract_text(segments),
-                    self._mention_names,
+                    mention_names,
                 )
                 if textual_mentioned:
                     mentioned = True
@@ -700,21 +1060,8 @@ class NapCatAdapter(BasePlatformAdapter):
             if self._self_id and mentioned:
                 segments = _strip_bot_mention(segments, self._self_id)
 
-        # Authorization. Permissions are QQ-number based only. Display names are
-        # intentionally ignored because they are user-controlled and spoofable.
-        # - private chats: owner/admin only
-        # - group chats: group must be allowlisted; ordinary users are accepted
-        #   only inside those groups
-        owners = set(self._owners)
-        admins = set(self._admins)
-        role = _role_for_user(sender_id, owners, admins)
-        identity_label = _sender_identity_label(role, sender_id, sender_name)
-        if is_group:
-            if not self._group_allow_chats or group_id not in self._group_allow_chats:
-                return
-        else:
-            if role not in {"owner", "admin"}:
-                return
+        # Authorization above is QQ-number based only. Display names remain
+        # decorative because they are user-controlled and spoofable.
 
         # Mirror the gateway's own authorization check before adding QQ
         # reactions.  The adapter's chat allowlist is intentionally coarse
@@ -735,6 +1082,7 @@ class NapCatAdapter(BasePlatformAdapter):
             text = textual_mention_text
         image_urls = _extract_images(segments)
         record_url = _extract_record(segments)
+        captionless_media = bool(is_group and not text.strip() and (image_urls or record_url))
 
         if is_group and mentioned and not text.strip() and not image_urls and not record_url:
             text = "hi"
@@ -799,12 +1147,24 @@ class NapCatAdapter(BasePlatformAdapter):
                 )
                 q_role = _role_for_user(q_user_id, owners, admins)
                 q_identity = _sender_identity_label(q_role, q_user_id, q_name)
-                q_text = _extract_text(quoted.get("message", []))
-                if q_text:
-                    reply_text = f"{q_identity}: {q_text}"
-                    text = f"[引用 {q_identity} 的消息: {q_text}]\n{text}"
+                q_segments = quoted.get("message", [])
+                q_text = _extract_text(q_segments)
+                quote_context, reply_text = _quoted_message_context(
+                    q_identity,
+                    q_text,
+                    q_segments,
+                )
+                text = f"{quote_context}\n{text}"
             except Exception:
                 pass
+
+        if captionless_media:
+            text = _captionless_media_context(
+                text,
+                identity_label,
+                has_image=bool(image_urls),
+                has_voice=bool(record_url),
+            )
 
         # Prefix normal group messages after quote extraction so the whole
         # model-visible user turn reads like MC chat: `[owner]<QQ> content`.
@@ -823,34 +1183,24 @@ class NapCatAdapter(BasePlatformAdapter):
             max_bytes = self._media_max_mb * 1024 * 1024
             for url in image_urls[:1]:  # cache first image for vision tool
                 try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url) as resp:
-                            resp.raise_for_status()
-                            img_data = await resp.read()
-                    if len(img_data) <= max_bytes:
-                        cached = cache_image_from_bytes(img_data)
-                        media_urls.append(cached)
-                        media_types.append("image/jpeg")
+                    img_data = await download_public_url_bytes(
+                        url,
+                        max_bytes=max_bytes,
+                        timeout=25,
+                    )
+                    cached = cache_image_from_bytes(img_data)
+                    media_urls.append(cached)
+                    media_types.append("image/jpeg")
                 except Exception as exc:
                     logger.debug("NapCat: image download failed: %s", exc)
 
         elif record_url:
             msg_type = MessageType.VOICE
-            max_bytes = self._media_max_mb * 1024 * 1024
-            wav = await _download_and_convert_wav(record_url, max_bytes)
-            if wav:
-                media_urls.append(wav)
-                media_types.append("audio/wav")
-                logger.debug("NapCat: voice -> %s", wav)
 
-        if not text and not media_urls:
+        if not text and not media_urls and not record_url:
             return
 
         original_message_id = str(event.get("message_id", "") or "")
-        if original_message_id:
-            self._remember_post_reply_reaction(original_message_id)
-            self._remember_post_reply_poke(original_message_id, sender_id, group_id)
-            await self._mark_processing(original_message_id)
 
         source = SessionSource(
             platform=self._source_platform,
@@ -907,29 +1257,49 @@ class NapCatAdapter(BasePlatformAdapter):
             timestamp=datetime.fromtimestamp(event["time"]) if event.get("time") else datetime.now(),
             channel_prompt=permission_prompt,
         )
-
-        # Set per-message context so admin-gated tools know who is asking
-        try:
-            from . import qq_tool as _qq_tool
-            _qq_tool._set_context(sender_id, role=role)
-        except ImportError:
-            pass
-
-        inline_command_completion = self._needs_inline_command_completion_reaction(message_event)
+        message_event.metadata["_napcat_temp_media_paths"] = []
 
         typing_task: asyncio.Task[None] | None = None
-        if not is_group:
-            typing_task = self._start_private_typing(sender_id)
         try:
+            if record_url:
+                max_bytes = self._media_max_mb * 1024 * 1024
+                wav = await _download_and_convert_wav(record_url, max_bytes)
+                if wav:
+                    message_event.metadata["_napcat_temp_media_paths"] = [wav]
+                    message_event.media_urls.append(wav)
+                    message_event.media_types.append("audio/wav")
+                    logger.debug("NapCat: voice -> %s", wav)
+
+            if not text and not message_event.media_urls:
+                return
+
+            if original_message_id:
+                self._remember_post_reply_reaction(original_message_id)
+                self._remember_post_reply_poke(original_message_id, sender_id, group_id)
+                await self._mark_processing(original_message_id)
+
+            inline_command_completion = self._needs_inline_command_completion_reaction(message_event)
+            if not is_group:
+                typing_task = self._start_private_typing(sender_id)
             await self.handle_message(message_event)
             if inline_command_completion:
-                await self._clear_processing(message_event.message_id)
-                await self._mark_post_response(message_event.message_id)
+                await self._complete_inline_command(message_event)
+        except BaseException:
+            _cleanup_event_temp_media(message_event)
+            raise
         finally:
             if typing_task:
                 typing_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await typing_task
+
+    async def _complete_inline_command(self, event: MessageEvent) -> None:
+        """Finish an inline command whose core path skips processing-complete hooks."""
+        try:
+            await self._clear_processing(event.message_id)
+            await self._mark_post_response(event.message_id)
+        finally:
+            _cleanup_event_temp_media(event)
 
     def _remember_post_reply_poke(self, message_id: str, sender_id: str, group_id: str = "") -> None:
         if not self._poke_after_response or not message_id or not sender_id:
@@ -1037,7 +1407,8 @@ class NapCatAdapter(BasePlatformAdapter):
             logger.debug("NapCat: post-response emoji failed for %s: %s", message_id, exc)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """After successful delivery, replace processing reaction with done reaction."""
+        """Clean temporary media, then update completion reactions after delivery."""
+        _cleanup_event_temp_media(event)
         message_id = getattr(event, "message_id", None)
         chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
         actual_message_id = self._pending_completion_reply_anchors.pop(chat_id, None) or message_id
@@ -1489,7 +1860,9 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict:
     if isinstance(extra, dict):
         seeded.update(extra)
     for key in (
-        "http_api", "access_token", "self_id", "ws_port", "media_max_mb",
+        "http_api", "access_token", "self_id", "ws_port", "ws_host", "ws_access_token",
+        "ws_allowed_ips", "ws_max_message_bytes", "ws_heartbeat_seconds", "ws_max_inflight",
+        "media_max_mb",
         "owners", "owner", "admins", "group_allow_chats", "group_allowed_chats", "allowed_groups",
         "require_mention", "group_require_mention", "processing_emoji",
         "processing_emoji_enabled", "processing_emoji_id", "poke_after_response",

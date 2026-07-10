@@ -8,6 +8,7 @@ Out-of-tree Hermes Agent platform plugin for QQ via [NapCat](https://github.com/
 
 - QQ group and private-message adapter for Hermes Gateway
 - Reverse WebSocket listener for NapCat events
+- Authenticated reverse WebSocket with bot-ID validation and bounded event handling
 - OneBot 11 HTTP API client for sending text, images, voice, video, and files
 - `qq_*` toolset for QQ messaging, group management, OCR, translation, reactions, notices, and files
 - QQ-number based owner/admin/user ACL for NapCat tool calls
@@ -23,6 +24,8 @@ Out-of-tree Hermes Agent platform plugin for QQ via [NapCat](https://github.com/
 - NapCat configured with:
   - OneBot 11 HTTP API enabled
   - reverse WebSocket target pointing to the Hermes host and `ws_port`
+  - a non-empty reverse WebSocket token; it reuses the HTTP API token by default,
+    or may be configured separately with `ws_access_token`
 - Python dependency: `aiohttp`（通常 Hermes gateway 环境里已经有）
 
 ## Installation
@@ -49,15 +52,23 @@ platforms:
     enabled: true
     extra:
       http_api: "http://127.0.0.1:18801"
-      access_token: ""
-      self_id: "123456789"
+      access_token: "<required-high-entropy-token>"
+      self_id: "<BOT_QQ_ID>"
+      ws_host: "0.0.0.0"
       ws_port: 18800
+      # Defaults to access_token. Set the same token in NapCat's WS client.
+      # ws_access_token: "a-separate-high-entropy-token"
+      ws_allowed_ips:
+        - "<NAPCAT_HOST_IP>"
+      ws_max_message_bytes: 2097152
+      ws_max_inflight: 32
+      ws_heartbeat_seconds: 30
 
       owners:
-        - "123456789"
+        - "<OWNER_QQ_ID>"
       admins: []
 
-      # Optional: restrict which QQ groups can talk to Hermes.
+      # Required for group replies. An empty list rejects every group.
       group_allow_chats: []
 
       # Optional: require @bot in groups.
@@ -81,7 +92,6 @@ platforms:
 Then validate and restart the gateway:
 
 ```bash
-python -m py_compile ~/.hermes/plugins/hermes-napcat/*.py
 hermes config check
 hermes gateway restart
 ```
@@ -91,6 +101,13 @@ NapCat should connect to:
 ```text
 ws://<hermes-host>:18800
 ```
+
+The plugin rejects unauthenticated reverse-WebSocket connections. Standard
+Bearer authentication is supported; the OneBot `access_token` query parameter
+is also accepted for compatibility. The listener refuses to start when neither
+`ws_access_token` nor `access_token` is configured, including loopback-only
+listeners. `ws_allowed_ips` is optional defense in depth and must contain the
+NapCat host address when set.
 
 ## Access control
 
@@ -121,14 +138,17 @@ plugin.yaml     # Hermes plugin metadata
 Basic validation:
 
 ```bash
-python -m py_compile *.py
+# Use the same Python environment that runs Hermes Agent.
+HERMES_PYTHON=/path/to/hermes/venv/bin/python
+"$HERMES_PYTHON" -m py_compile *.py
 ```
 
 Recommended pre-publish checks:
 
 ```bash
 git status --short
-python -m py_compile *.py
+"$HERMES_PYTHON" -m py_compile *.py tests/*.py
+"$HERMES_PYTHON" -m unittest discover -s tests -v
 ```
 
 ## License
