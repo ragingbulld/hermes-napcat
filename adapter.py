@@ -143,6 +143,28 @@ def _is_slash_command(content: str) -> bool:
     return bool(re.match(r"^\s*/[A-Za-z][\w-]*(?:\s|$)", content or ""))
 
 
+def _is_non_final_progress_message(content: str, metadata: dict | None = None) -> bool:
+    """Return True for gateway progress/status bubbles, never final replies.
+
+    Hermes' long-running heartbeat currently reaches non-Discord adapters without
+    the generic ``non_conversational`` metadata marker.  NapCat normally falls
+    back to the active incoming message as a QQ reply anchor, so an unmarked
+    heartbeat such as ``Working — 10 min`` can look like the final answer and can
+    enter the plugin's queued-reply completion bookkeeping.  Recognize both the
+    forward-compatible metadata marker and the current heartbeat text locally.
+    """
+    meta = metadata or {}
+    if meta.get("non_conversational") or meta.get("non_conversational_history"):
+        return True
+    return bool(
+        re.match(
+            r"^\s*⏳\s*Working\s*[—-]\s*\d+\s*min(?:\b|\s|[—-])",
+            str(content or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _safe_identity_part(value: str, *, max_len: int = 32) -> str:
     """Keep sender labels compact and bracket-safe for gateway prefixes."""
     cleaned = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
@@ -1275,7 +1297,15 @@ class NapCatAdapter(BasePlatformAdapter):
     ) -> SendResult:
         try:
             is_group, num_id = self._parse_chat_id(chat_id)
-            effective_reply_to = self._effective_reply_to(chat_id, reply_to, metadata)
+            progress_only = _is_non_final_progress_message(content, metadata)
+            # Heartbeats/status bubbles are informational side-channel messages,
+            # not answers.  Never quote the active QQ message and never let them
+            # consume queued-reply completion state or trigger done/poke actions.
+            effective_reply_to = (
+                None
+                if progress_only
+                else self._effective_reply_to(chat_id, reply_to, metadata)
+            )
             chunks = _chunk_text(_strip_markdown(content))
             last_id: str | None = None
             for i, chunk in enumerate(chunks):
@@ -1291,11 +1321,12 @@ class NapCatAdapter(BasePlatformAdapter):
                 else:
                     r = await send_private_msg(self._http_api, num_id, segs, self._access_token or None)
                 last_id = str(r.get("message_id", ""))
-            inline_completion_anchor = self._inline_completion_reply_anchors.pop(str(chat_id), None)
-            if inline_completion_anchor and effective_reply_to and inline_completion_anchor == str(effective_reply_to):
-                await self._clear_processing(inline_completion_anchor)
-                await self._mark_post_response(inline_completion_anchor)
-            await self._poke_after_reply(effective_reply_to)
+            if not progress_only:
+                inline_completion_anchor = self._inline_completion_reply_anchors.pop(str(chat_id), None)
+                if inline_completion_anchor and effective_reply_to and inline_completion_anchor == str(effective_reply_to):
+                    await self._clear_processing(inline_completion_anchor)
+                    await self._mark_post_response(inline_completion_anchor)
+                await self._poke_after_reply(effective_reply_to)
             return SendResult(success=True, message_id=last_id)
         except Exception as exc:
             logger.error("NapCat send error: %s", exc)
