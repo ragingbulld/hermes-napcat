@@ -442,6 +442,28 @@ class VoiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         instance._mark_post_response.assert_awaited_once_with("123")
         self.assertFalse(Path(wav).exists())
 
+    async def test_busy_inline_command_does_not_pollute_next_reply_anchor(self):
+        adapter = _load_module("adapter")
+        instance = object.__new__(adapter.NapCatAdapter)
+        instance._busy_followup_reply_anchors = {}
+        instance._next_final_reply_anchors = {}
+        instance._inline_completion_reply_anchors = {}
+        instance._pending_completion_reply_anchors = {}
+        instance._active_sessions = {"session"}
+        instance._session_key_for_event = lambda _event: "session"
+        instance._needs_inline_command_completion_reaction = lambda _event: True
+
+        event = SimpleNamespace(
+            message_id="1884618342",
+            source=SimpleNamespace(chat_id="group:1041762935"),
+            get_command=lambda: "status",
+        )
+
+        with patch.object(adapter.BasePlatformAdapter, "handle_message", AsyncMock()):
+            await instance.handle_message(event)
+
+        self.assertEqual(instance._busy_followup_reply_anchors, {})
+
     def _voice_test_instance(self, adapter):
         instance = object.__new__(adapter.NapCatAdapter)
         instance._owners = {"123"}

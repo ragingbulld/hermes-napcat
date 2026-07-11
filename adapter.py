@@ -1454,7 +1454,12 @@ class NapCatAdapter(BasePlatformAdapter):
                 self._next_final_reply_anchors.pop(chat_id, None)
                 self._inline_completion_reply_anchors.pop(chat_id, None)
                 self._pending_completion_reply_anchors.pop(chat_id, None)
-            elif chat_id and message_id and session_key in self._active_sessions:
+            elif (
+                chat_id
+                and message_id
+                and session_key in self._active_sessions
+                and not self._needs_inline_command_completion_reaction(event)
+            ):
                 anchors = self._busy_followup_reply_anchors.setdefault(chat_id, [])
                 msg = str(message_id)
                 if msg not in anchors and self._next_final_reply_anchors.get(chat_id) != msg:
