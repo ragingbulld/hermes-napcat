@@ -21,6 +21,7 @@ Configuration in ~/.hermes/config.yaml:
           processing_emoji_id: "307" # QQ emoji ID, 307 = /喵喵
           post_response_emoji: true  # react again after a successful reply
           post_response_emoji_id: "478" # 用户确认的“对的对的” reaction ID
+          quote_reply: true          # attach OneBot reply-quote segment to outbound answers
           private_typing_status: true # show “正在输入中” while preparing DM replies
           private_typing_event_type: 1
           private_typing_interval: 5
@@ -43,6 +44,7 @@ import subprocess
 import tempfile
 import unicodedata
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -54,7 +56,9 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    cache_document_from_bytes,
     cache_image_from_bytes,
+    cache_video_from_bytes,
 )
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
@@ -189,23 +193,35 @@ def _is_slash_command(content: str) -> bool:
 def _is_non_final_progress_message(content: str, metadata: dict | None = None) -> bool:
     """Return True for gateway progress/status bubbles, never final replies.
 
-    Hermes' long-running heartbeat currently reaches non-Discord adapters without
-    the generic ``non_conversational`` metadata marker.  NapCat normally falls
-    back to the active incoming message as a QQ reply anchor, so an unmarked
-    heartbeat such as ``Working — 10 min`` can look like the final answer and can
-    enter the plugin's queued-reply completion bookkeeping.  Recognize both the
-    forward-compatible metadata marker and the current heartbeat text locally.
+    Hermes' long-running heartbeat and background self-improvement review
+    currently reach non-Discord adapters without the generic
+    ``non_conversational`` metadata marker (that marker is Discord-only in
+    gateway/run.py).  NapCat normally falls back to the active incoming
+    message as a QQ reply anchor, so an unmarked status bubble such as
+    ``Working — 10 min`` or ``💾 Self-improvement review: ...`` can look like
+    the final answer and can enter the plugin's queued-reply completion
+    bookkeeping — which makes the next real reply quote the wrong message.
+    Recognize both the forward-compatible metadata marker and known status
+    text patterns locally.
     """
     meta = metadata or {}
     if meta.get("non_conversational") or meta.get("non_conversational_history"):
         return True
-    return bool(
-        re.match(
-            r"^\s*⏳\s*Working\s*[—-]\s*\d+\s*min(?:\b|\s|[—-])",
-            str(content or ""),
-            flags=re.IGNORECASE,
-        )
+    text = str(content or "")
+    patterns = (
+        # Long-running turn heartbeat.
+        r"^\s*⏳\s*Working\s*[—-]\s*\d+\s*min(?:\b|\s|[—-])",
+        # Background self-improvement review summary (post-turn).
+        r"^\s*💾\s*Self-improvement review:\s+\S",
+        # Compact/legacy memory-notification forms.
+        r"^\s*💾\s*Memory updated\b",
+        r"^\s*💾\s+Skill\s+['\"].+?['\"]\s+(?:created|updated|improved|patched)\.?\s*$",
+        # Background process / gateway lifecycle status bumps.
+        r"^\s*\[Background process\s+\S+\s+(?:finished with exit code|is still running~)",
+        r"^\s*(?:✅|❌)\s+Hermes update\s+(?:finished|failed|timed out)",
+        r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)",
     )
+    return any(re.match(p, text, flags=re.IGNORECASE | re.DOTALL) for p in patterns)
 
 
 def _safe_identity_part(value: str, *, max_len: int = 32) -> str:
@@ -518,6 +534,75 @@ def _extract_record(segments: list[dict]) -> str | None:
     return None
 
 
+def _extract_videos(segments: list[dict]) -> list[str]:
+    return [
+        s["data"].get("url") or s["data"].get("file", "")
+        for s in segments if s.get("type") == "video"
+        if s.get("data", {}).get("url") or s.get("data", {}).get("file")
+    ]
+
+
+def _extract_files(segments: list[dict]) -> list[dict[str, Any]]:
+    """Return raw file-like segments with enough metadata to resolve a download."""
+    files: list[dict[str, Any]] = []
+    for s in segments or []:
+        if s.get("type") not in {"file", "document"}:
+            continue
+        data = s.get("data") or {}
+        files.append(
+            {
+                "url": data.get("url") or data.get("file") or "",
+                "name": data.get("name") or data.get("file") or "file",
+                "file_id": data.get("file_id") or data.get("id") or "",
+                "busid": data.get("busid", 0),
+            }
+        )
+    return files
+
+
+def _guess_media_ext(name_or_url: str, default: str = "") -> str:
+    path = str(name_or_url or "").split("?")[0]
+    ext = Path(path).suffix.lower()
+    if ext and len(ext) <= 8:
+        return ext
+    return default
+
+
+def _mime_for_ext(ext: str, fallback: str = "application/octet-stream") -> str:
+    mapping = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".webm": "video/webm",
+        ".mkv": "video/x-matroska",
+        ".avi": "video/x-msvideo",
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".ogg": "audio/ogg",
+        ".m4a": "audio/mp4",
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".json": "application/json",
+        ".csv": "text/csv",
+        ".zip": "application/zip",
+        ".7z": "application/x-7z-compressed",
+        ".rar": "application/vnd.rar",
+        ".doc": "application/msword",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xls": "application/vnd.ms-excel",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".ppt": "application/vnd.ms-powerpoint",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    }
+    return mapping.get(str(ext or "").lower(), fallback)
+
+
 def _extract_reply_id(segments: list[dict]) -> int | None:
     for s in segments:
         if s["type"] == "reply":
@@ -769,6 +854,13 @@ class NapCatAdapter(BasePlatformAdapter):
             default=False,
         )
         self._post_response_emoji_id: str = str(extra.get("post_response_emoji_id", "478"))
+        # Whether outbound answers should include a OneBot reply/quote segment.
+        # Keep reply-anchor bookkeeping even when disabled so processing/done
+        # emoji still target the correct original message.
+        self._quote_reply_enabled: bool = _as_bool(
+            extra.get("quote_reply", extra.get("quote_reply_enabled", True)),
+            default=True,
+        )
         self._private_typing_enabled: bool = _as_bool(
             extra.get("private_typing_status", extra.get("private_typing_enabled", True)),
             default=True,
@@ -1132,9 +1224,13 @@ class NapCatAdapter(BasePlatformAdapter):
                 else:
                     text = stripped_text
 
-        # Fetch quoted message text for reply context
+        # Fetch quoted message content for reply context.  Text is inlined into the
+        # model-visible turn; media is downloaded into local cache paths and attached
+        # as event.media_urls so Hermes can feed images/files/videos to the agent.
         reply_id = _extract_reply_id(event.get("message", []))
         reply_text: str | None = None
+        quoted_media_urls: list[str] = []
+        quoted_media_types: list[str] = []
         if reply_id:
             try:
                 quoted = await get_msg(self._http_api, reply_id, self._access_token or None)
@@ -1155,8 +1251,78 @@ class NapCatAdapter(BasePlatformAdapter):
                     q_segments,
                 )
                 text = f"{quote_context}\n{text}"
-            except Exception:
-                pass
+                max_bytes = self._media_max_mb * 1024 * 1024
+                # Quoted images: cache and attach so native vision / vision_analyze can see them.
+                for url in _extract_images(q_segments)[:3]:
+                    try:
+                        img_data = await download_public_url_bytes(
+                            url,
+                            max_bytes=max_bytes,
+                            timeout=25,
+                        )
+                        ext = _guess_media_ext(url, ".png")
+                        if ext not in _IMAGE_EXTS:
+                            ext = ".png"
+                        cached = cache_image_from_bytes(img_data, ext=ext)
+                        quoted_media_urls.append(cached)
+                        quoted_media_types.append(_mime_for_ext(ext, "image/png"))
+                    except Exception as exc:
+                        logger.debug("NapCat: quoted image download failed: %s", exc)
+                # Quoted videos: path-pointing note for the agent (video tool if enabled).
+                for url in _extract_videos(q_segments)[:1]:
+                    try:
+                        data = await download_public_url_bytes(
+                            url,
+                            max_bytes=max_bytes,
+                            timeout=60,
+                        )
+                        ext = _guess_media_ext(url, ".mp4") or ".mp4"
+                        if ext not in _VIDEO_EXTS:
+                            ext = ".mp4"
+                        cached = cache_video_from_bytes(data, ext=ext)
+                        quoted_media_urls.append(cached)
+                        quoted_media_types.append(_mime_for_ext(ext, "video/mp4"))
+                    except Exception as exc:
+                        logger.debug("NapCat: quoted video download failed: %s", exc)
+                # Quoted file attachments.
+                for fmeta in _extract_files(q_segments)[:3]:
+                    try:
+                        file_url = await self._resolve_quoted_file_url(
+                            fmeta,
+                            group_id if is_group else "",
+                        )
+                        if not file_url:
+                            logger.debug(
+                                "NapCat: quoted file has no resolvable URL: name=%s file_id=%s",
+                                fmeta.get("name"),
+                                fmeta.get("file_id"),
+                            )
+                            continue
+                        data = await download_public_url_bytes(
+                            file_url,
+                            max_bytes=max_bytes,
+                            timeout=60,
+                        )
+                        name = str(fmeta.get("name") or "file")
+                        cached = cache_document_from_bytes(data, name)
+                        quoted_media_urls.append(cached)
+                        quoted_media_types.append(
+                            _mime_for_ext(_guess_media_ext(name), "application/octet-stream")
+                        )
+                    except Exception as exc:
+                        logger.debug("NapCat: quoted file download failed: %s", exc)
+                # Quoted voice: convert to wav so STT can run like a normal voice message.
+                q_record = _extract_record(q_segments)
+                if q_record:
+                    try:
+                        wav = await _download_and_convert_wav(q_record, max_bytes)
+                        if wav:
+                            quoted_media_urls.append(wav)
+                            quoted_media_types.append("audio/wav")
+                    except Exception as exc:
+                        logger.debug("NapCat: quoted voice download failed: %s", exc)
+            except Exception as exc:
+                logger.debug("NapCat: quoted message fetch failed for %s: %s", reply_id, exc)
 
         if captionless_media:
             text = _captionless_media_context(
@@ -1196,6 +1362,20 @@ class NapCatAdapter(BasePlatformAdapter):
 
         elif record_url:
             msg_type = MessageType.VOICE
+
+        # Attach media from the quoted parent message so the agent can see it.
+        if quoted_media_urls:
+            media_urls.extend(quoted_media_urls)
+            media_types.extend(quoted_media_types)
+            if msg_type == MessageType.TEXT:
+                if any(str(t).startswith("image/") for t in quoted_media_types):
+                    msg_type = MessageType.PHOTO
+                elif any(str(t).startswith("video/") for t in quoted_media_types):
+                    msg_type = MessageType.VIDEO
+                elif any(str(t).startswith("audio/") for t in quoted_media_types):
+                    msg_type = MessageType.VOICE
+                else:
+                    msg_type = MessageType.DOCUMENT
 
         if not text and not media_urls and not record_url:
             return
@@ -1257,7 +1437,13 @@ class NapCatAdapter(BasePlatformAdapter):
             timestamp=datetime.fromtimestamp(event["time"]) if event.get("time") else datetime.now(),
             channel_prompt=permission_prompt,
         )
-        message_event.metadata["_napcat_temp_media_paths"] = []
+        # Track temporary files we created (quoted voice wavs + current voice wavs)
+        # so they can be cleaned after processing.
+        temp_media_paths = [
+            path for path, mtype in zip(media_urls, media_types)
+            if str(mtype).startswith("audio/") and str(path).endswith(".wav")
+        ]
+        message_event.metadata["_napcat_temp_media_paths"] = temp_media_paths
 
         typing_task: asyncio.Task[None] | None = None
         try:
@@ -1265,7 +1451,7 @@ class NapCatAdapter(BasePlatformAdapter):
                 max_bytes = self._media_max_mb * 1024 * 1024
                 wav = await _download_and_convert_wav(record_url, max_bytes)
                 if wav:
-                    message_event.metadata["_napcat_temp_media_paths"] = [wav]
+                    message_event.metadata.setdefault("_napcat_temp_media_paths", []).append(wav)
                     message_event.media_urls.append(wav)
                     message_event.media_types.append("audio/wav")
                     logger.debug("NapCat: voice -> %s", wav)
@@ -1349,6 +1535,64 @@ class NapCatAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("NapCat: inline command reaction check failed: %s", exc)
             return False
+
+    async def _resolve_quoted_file_url(
+        self,
+        fmeta: dict[str, Any],
+        group_id: str = "",
+    ) -> str | None:
+        """Resolve a downloadable HTTP(S) URL for a quoted QQ file segment."""
+        direct = str(fmeta.get("url") or "").strip()
+        if direct.startswith(("http://", "https://")):
+            return direct
+
+        file_id = str(fmeta.get("file_id") or "").strip()
+        if not file_id:
+            # Some builds put a bare file id into the "file" field without a scheme.
+            candidate = str(fmeta.get("url") or "").strip()
+            if candidate and not candidate.startswith(("file://", "/")):
+                file_id = candidate
+        if not file_id:
+            return None
+
+        try:
+            if group_id:
+                resp = await call_onebot_api(
+                    self._http_api,
+                    "get_group_file_url",
+                    {
+                        "group_id": int(str(group_id).removeprefix("group:")),
+                        "file_id": file_id,
+                        "busid": int(fmeta.get("busid") or 0),
+                    },
+                    self._access_token or None,
+                )
+            else:
+                # Best-effort private-file fallback; not all NapCat builds support this.
+                resp = await call_onebot_api(
+                    self._http_api,
+                    "get_private_file_url",
+                    {
+                        "file_id": file_id,
+                        "busid": int(fmeta.get("busid") or 0),
+                    },
+                    self._access_token or None,
+                )
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if not isinstance(data, dict):
+                return None
+            for key in ("url", "file", "file_url"):
+                value = str(data.get(key) or "").strip()
+                if value.startswith(("http://", "https://")):
+                    return value
+        except Exception as exc:
+            logger.debug(
+                "NapCat: resolve quoted file url failed file_id=%s group=%s: %s",
+                file_id,
+                group_id,
+                exc,
+            )
+        return None
 
     async def _mark_processing(self, message_id: str) -> None:
         """React to the triggering QQ message to show Hermes accepted it."""
@@ -1594,8 +1838,10 @@ class NapCatAdapter(BasePlatformAdapter):
         reply_to: str | None = None,
         metadata: dict | None = None,
     ) -> dict | None:
+        # Still resolve the effective anchor so callers can keep emoji/poke
+        # completion aligned with the turn being answered.
         anchor = self._effective_reply_to(chat_id, reply_to, metadata)
-        if not anchor:
+        if not self._quote_reply_enabled or not anchor:
             return None
         try:
             return reply_segment(int(anchor))
@@ -1686,7 +1932,7 @@ class NapCatAdapter(BasePlatformAdapter):
             last_id: str | None = None
             for i, chunk in enumerate(chunks):
                 segs: list[dict] = []
-                if i == 0 and effective_reply_to:
+                if i == 0 and self._quote_reply_enabled and effective_reply_to:
                     try:
                         segs.append(reply_segment(int(effective_reply_to)))
                     except (ValueError, TypeError):

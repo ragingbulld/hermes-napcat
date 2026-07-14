@@ -111,6 +111,85 @@ class GroupQuoteAttributionTests(unittest.TestCase):
         self.assertEqual(context, "[引用 [user]<123>「阿牛」 的语音消息]")
         self.assertEqual(reply_text, "[user]<123>「阿牛」 的语音消息")
 
+    def test_extracts_quoted_media_segments(self):
+        adapter = _load_adapter()
+        segments = [
+            {"type": "image", "data": {"url": "https://cdn.example/a.png"}},
+            {"type": "video", "data": {"url": "https://cdn.example/a.mp4"}},
+            {
+                "type": "file",
+                "data": {
+                    "url": "https://cdn.example/a.pdf",
+                    "name": "a.pdf",
+                    "file_id": "fid-1",
+                    "busid": 1,
+                },
+            },
+            {"type": "record", "data": {"file": "https://cdn.example/a.silk"}},
+        ]
+
+        self.assertEqual(
+            adapter._extract_images(segments),
+            ["https://cdn.example/a.png"],
+        )
+        self.assertEqual(
+            adapter._extract_videos(segments),
+            ["https://cdn.example/a.mp4"],
+        )
+        self.assertEqual(
+            adapter._extract_files(segments),
+            [
+                {
+                    "url": "https://cdn.example/a.pdf",
+                    "name": "a.pdf",
+                    "file_id": "fid-1",
+                    "busid": 1,
+                }
+            ],
+        )
+        self.assertEqual(
+            adapter._extract_record(segments),
+            "https://cdn.example/a.silk",
+        )
+        self.assertEqual(adapter._guess_media_ext("report.PDF?x=1", ".bin"), ".pdf")
+        self.assertEqual(adapter._mime_for_ext(".png"), "image/png")
+        self.assertEqual(adapter._mime_for_ext(".pdf"), "application/pdf")
+
+
+class QuotedFileResolveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resolve_quoted_file_url_prefers_direct_http_url(self):
+        adapter = _load_adapter()
+        instance = object.__new__(adapter.NapCatAdapter)
+        instance._http_api = "http://napcat.test"
+        instance._access_token = "token"
+
+        url = await instance._resolve_quoted_file_url(
+            {"url": "https://cdn.example/a.pdf", "file_id": "fid"},
+            "1041762935",
+        )
+        self.assertEqual(url, "https://cdn.example/a.pdf")
+
+    async def test_resolve_quoted_file_url_uses_group_file_api(self):
+        adapter = _load_adapter()
+        instance = object.__new__(adapter.NapCatAdapter)
+        instance._http_api = "http://napcat.test"
+        instance._access_token = "token"
+        api_call = AsyncMock(
+            return_value={"data": {"url": "https://cdn.example/resolved.pdf"}}
+        )
+        with patch.object(adapter, "call_onebot_api", api_call):
+            url = await instance._resolve_quoted_file_url(
+                {"url": "", "file_id": "fid-1", "busid": 2},
+                "1041762935",
+            )
+        self.assertEqual(url, "https://cdn.example/resolved.pdf")
+        api_call.assert_awaited_once_with(
+            "http://napcat.test",
+            "get_group_file_url",
+            {"group_id": 1041762935, "file_id": "fid-1", "busid": 2},
+            "token",
+        )
+
 
 class GroupMentionNameTests(unittest.IsolatedAsyncioTestCase):
     async def test_fetches_and_caches_bot_group_card(self):

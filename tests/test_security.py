@@ -464,6 +464,71 @@ class VoiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(instance._busy_followup_reply_anchors, {})
 
+    def test_self_improvement_review_is_progress_only(self):
+        adapter = _load_module("adapter")
+        text = (
+            "💾 Self-improvement review: Patched SKILL.md in skill "
+            "'hermes-ops-troubleshooting' (1 replacement). · "
+            "Patched SKILL.md in skill 'source-backed-tech-answers' (1 replacement)."
+        )
+        self.assertTrue(adapter._is_non_final_progress_message(text))
+        self.assertTrue(adapter._is_non_final_progress_message("💾 Memory updated"))
+        self.assertTrue(
+            adapter._is_non_final_progress_message(
+                "⏳ Working — 10 min — iteration 18/150, waiting for non-streaming API response"
+            )
+        )
+        self.assertFalse(
+            adapter._is_non_final_progress_message(
+                "关好了。目标：乌托邦探险之旅"
+            )
+        )
+
+    async def test_self_improvement_send_does_not_consume_reply_anchors(self):
+        adapter = _load_module("adapter")
+        instance = object.__new__(adapter.NapCatAdapter)
+        instance._http_api = "http://127.0.0.1:18801"
+        instance._access_token = "token"
+        instance._quote_reply_enabled = True
+        instance._inline_completion_reply_anchors = {
+            "group:1041762935": "111"
+        }
+        instance._active_reply_anchors = {"group:1041762935": "111"}
+        instance._next_final_reply_anchors = {}
+        instance._busy_followup_reply_anchors = {}
+        instance._pending_completion_reply_anchors = {}
+        instance._post_reply_pokes = {}
+        instance._poke_after_reply = AsyncMock()
+        instance._clear_processing = AsyncMock()
+        instance._mark_post_response = AsyncMock()
+
+        captured = {}
+
+        async def fake_send_group_msg(api, group_id, segs, token=None):
+            captured["segs"] = segs
+            return {"message_id": 999}
+
+        with patch.object(adapter, "send_group_msg", fake_send_group_msg):
+            result = await instance.send(
+                "group:1041762935",
+                "💾 Self-improvement review: Patched SKILL.md in skill 'x' (1 replacement).",
+            )
+
+        self.assertTrue(result.success)
+        # No QQ quote-reply segment for status bubbles.
+        self.assertEqual(
+            [seg.get("type") for seg in captured["segs"]],
+            ["text"],
+        )
+        # Must not consume completion bookkeeping meant for the real answer.
+        self.assertEqual(
+            instance._inline_completion_reply_anchors,
+            {"group:1041762935": "111"},
+        )
+        instance._clear_processing.assert_not_awaited()
+        instance._mark_post_response.assert_not_awaited()
+        instance._poke_after_reply.assert_not_awaited()
+
     def _voice_test_instance(self, adapter):
         instance = object.__new__(adapter.NapCatAdapter)
         instance._owners = {"123"}
